@@ -1,0 +1,48 @@
+# MRI data - never commit (files are gigabytes)
+data/
+*.mat
+*.nii
+*.nii.gz
+*.h5
+*.hdf5
+
+# Model weights
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Outputs and logs
+outputs/
+logs/
+
+# API keys and secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Conda / pip
+.conda/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
