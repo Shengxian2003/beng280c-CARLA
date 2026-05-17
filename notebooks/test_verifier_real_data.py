@@ -24,8 +24,10 @@ VENC_M_PER_S = 1.5
 # Isotropic voxel size from OSU-MR dataset (update if known exactly)
 VOXEL_SIZE_MM = (2.0, 2.0, 2.0)
 
-# Vessels occupy ~10-20% of cardiac volume; 75th percentile ≈ top 25% by magnitude
-MASK_PERCENTILE = 75.0
+# PC-MRA threshold — 90th percentile + 1 closing iteration gives ~7% of volume,
+# appropriate for cardiac vessels (aorta + immediate branches + valves)
+MASK_PERCENTILE = 90.0
+MASK_CLOSING = 1
 
 
 def load_reconstruction(path: str) -> dict:
@@ -108,10 +110,15 @@ if __name__ == "__main__":
     print(f"  xHat   shape: {data['xHat'].shape}")
     print(f"  Phase range:  [{data['thetaX'].min():.3f}, {data['thetaX'].max():.3f}] rad")
 
-    from skills.physics_verifier._mask import velocity_mask
-    mask = velocity_mask(data["thetaX"], data["thetaY"], data["thetaZ"],
-                         venc_m_per_s=VENC_M_PER_S, percentile=MASK_PERCENTILE)
-    print(f"  Mask voxels: {mask.sum():,} ({mask.sum()/mask.size*100:.1f}% of volume)")
+    from skills.segmentation import segment
+    mask = segment(
+        data["thetaX"], data["thetaY"], data["thetaZ"], data["xHat"],
+        venc_m_per_s=VENC_M_PER_S,
+        percentile=MASK_PERCENTILE,
+        closing_iter=MASK_CLOSING,
+    )
+    print(f"  Segmented mask: {mask.sum():,} voxels "
+          f"({mask.sum()/mask.size*100:.2f}% of volume)")
 
     result = verify(
         data["thetaX"],
