@@ -1,0 +1,55 @@
+{
+  "n_logs": 1,
+  "per_log": [
+    {
+      "log_path": "logs/single_window_demo.jsonl",
+      "session_id": "7ef38925-c584-4f80-bcdb-65243244cf5d",
+      "session_status": "success",
+      "session_elapsed_s": 657.11,
+      "n_entries": 48,
+      "n_llm_calls": 28,
+      "n_tool_calls": 7,
+      "n_events": 11,
+      "n_verify_failures": 1,
+      "n_tool_errors": 0,
+      "reasoning_coverage": 1.0,
+      "long_reasoning_coverage": 1.0,
+      "decision_density_llm_per_tool": 4.0,
+      "traceability": 1.0,
+      "verifier_explanation_coverage": 1.0,
+      "total_llm_latency_ms": 645395,
+      "total_tool_latency_ms": 11653,
+      "llm_fraction_of_time": 0.9823,
+      "tool_call_counts": {
+        "load_reconstruction": 2,
+        "segment_from_seed": 2,
+        "suggest_seeds": 1,
+        "verify": 1,
+        "analyze": 1
+      },
+      "llm_purpose_counts": {
+        "planner": 3,
+        "plan_critic": 3,
+        "coordinator": 8,
+        "specialist.reconstruction": 6,
+        "specialist.segmentation": 4,
+        "specialist.verifier": 2,
+        "specialist.hemodynamic": 2
+      }
+    }
+  ],
+  "aggregate": {
+    "n_logs": 1,
+    "total_llm_calls": 28,
+    "total_tool_calls": 7,
+    "total_verify_failures": 1,
+    "mean": {
+      "reasoning_coverage": 1.0,
+      "long_reasoning_coverage": 1.0,
+      "decision_density_llm_per_tool": 4.0,
+      "traceability": 1.0,
+      "verifier_explanation_coverage": 1.0,
+      "llm_fraction_of_time": 0.9823
+    }
+  }
+}

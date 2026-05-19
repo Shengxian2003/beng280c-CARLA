@@ -221,16 +221,63 @@ def _tool_reconstruct(ws: Workspace, kspace_path: str,
                       voxel_size_mm_dy: float = 2.0,
                       voxel_size_mm_dx: float = 2.0,
                       use_gpu: bool = True) -> dict:
+    """Run a full CS/CORe reconstruction. Shows a live elapsed-time counter
+    + latest MATLAB output line every ``_RECON_PROGRESS_INTERVAL_S`` seconds
+    so the user knows the system isn't hung during the 1-12 min MATLAB call."""
+    import sys as _sys
+    import threading as _threading
+
     t0 = time.time()
-    result = _reconstruct(
-        kspace_path,
-        method=method,
-        n_iterations=n_iterations,
-        venc_m_per_s=venc_m_per_s,
-        use_gpu=use_gpu,
-        verbose=False,
-        save_preview=True,
+    latest_line = [""]                  # mutable holder shared with the timer thread
+    stop_event = _threading.Event()
+
+    def _capture_line(line: str) -> None:
+        # Keep the most recent non-empty line so the status preview shows
+        # the latest MATLAB iteration message, not just "starting…".
+        if line.strip():
+            latest_line[0] = line.strip()
+
+    def _print_progress() -> None:
+        while not stop_event.wait(_RECON_PROGRESS_INTERVAL_S):
+            elapsed = time.time() - t0
+            mins, secs = divmod(int(elapsed), 60)
+            line_preview = latest_line[0][:80] if latest_line[0] else "(MATLAB warming up...)"
+            # \r + flush so multiple status updates overwrite cleanly on one line
+            _sys.stderr.write(
+                f"\r[recon] {mins:>2d}m {secs:>2d}s elapsed — {line_preview:<80s}"
+            )
+            _sys.stderr.flush()
+
+    _sys.stderr.write(
+        f"\n[recon] starting MATLAB ({method}, {n_iterations} iter — expect "
+        f"{'~12 min on RTX 5090' if n_iterations >= 50 else '~1-3 min'})\n"
     )
+    _sys.stderr.flush()
+
+    timer = _threading.Thread(target=_print_progress, daemon=True)
+    timer.start()
+    try:
+        result = _reconstruct(
+            kspace_path,
+            method=method,
+            n_iterations=n_iterations,
+            venc_m_per_s=venc_m_per_s,
+            use_gpu=use_gpu,
+            verbose=False,
+            save_preview=True,
+            progress_callback=_capture_line,
+        )
+    finally:
+        stop_event.set()
+        timer.join(timeout=2)
+        elapsed = time.time() - t0
+        mins, secs = divmod(int(elapsed), 60)
+        _sys.stderr.write(
+            f"\r[recon] ✓ done in {mins}m {secs}s"
+            + " " * 60 + "\n"
+        )
+        _sys.stderr.flush()
+
     ws.recon = result
     ws.venc_m_per_s = venc_m_per_s
     ws.voxel_size_mm = (voxel_size_mm_dz, voxel_size_mm_dy, voxel_size_mm_dx)
@@ -245,6 +292,10 @@ def _tool_reconstruct(ws: Workspace, kspace_path: str,
         "elapsed_wall_s": round(time.time() - t0, 1),
         "matlab_elapsed_minutes": result.get("meta", {}).get("elapsed_minutes"),
     }
+
+
+# How often to refresh the elapsed-time status line during a MATLAB recon.
+_RECON_PROGRESS_INTERVAL_S = 3.0
 
 
 # ----- suggest_seeds -------------------------------------------------------

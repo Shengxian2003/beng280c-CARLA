@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 from .audit import AuditLog
 from .llm import LLM
+from .planner import Plan
 from .project_context import PROJECT_CONTEXT
 from .specialist import Specialist
 from .tools import Workspace
@@ -71,6 +72,19 @@ Always end with a done response within a reasonable number of steps.
 """
 
 
+def _coord_decision_summary(text: str) -> str:
+    """One-liner describing the Coordinator's decision for the status bar."""
+    try:
+        payload = json.loads(text)
+        if payload.get("done"):
+            return "done — emitting summary"
+        if "delegate_to" in payload:
+            return f"delegating to {payload['delegate_to']}"
+        return text[:120]
+    except (json.JSONDecodeError, TypeError):
+        return (text or "")[:120].replace("\n", " ")
+
+
 @dataclass
 class CoordinatorResult:
     status: str            # "success" | "max_steps" | "error"
@@ -90,7 +104,9 @@ class Coordinator:
         workspace: Workspace,
         audit: AuditLog,
         *,
-        max_delegations: int = 12,
+        max_delegations: int = 6,                   # was 12 — lowered to fail
+                                                    # faster on hard datasets
+        max_tokens: int = 8192,                     # was 2048 — match planner/critic
         verbose_callback: Optional[Callable[[str], None]] = None,
         project_context: str = PROJECT_CONTEXT,
     ):
@@ -99,37 +115,60 @@ class Coordinator:
         self.workspace = workspace
         self.audit = audit
         self.max_delegations = max_delegations
+        self.max_tokens = max_tokens
         self.verbose = verbose_callback
         self.project_context = project_context
 
-    def _initial_messages(self, user_goal: str) -> list[dict]:
+    def _initial_messages(
+        self, user_goal: str, plan: Plan | None = None, warning: str | None = None,
+    ) -> list[dict]:
         names = sorted(self.specialists)
         roster = "\n".join(f"  - {n}" for n in names)
-        system = (
-            self.project_context + "\n\n"
-            + COORDINATOR_SYSTEM
-            + COORDINATOR_PROTOCOL
-            + f"\n\n## Specialists actually available this session\n{roster}\n"
-        )
+        system_parts = [
+            self.project_context,
+            COORDINATOR_SYSTEM,
+            COORDINATOR_PROTOCOL,
+            f"\n\n## Specialists actually available this session\n{roster}\n",
+        ]
+        if plan is not None:
+            system_parts.append("\n\n" + plan.to_prompt_block())
+        if warning:
+            system_parts.append(
+                "\n\n## Plan Policy warning (carry forward)\n"
+                f"{warning}\n\nProceed, but the audit log will record this warning."
+            )
         return [
-            {"role": "system", "content": system},
+            {"role": "system", "content": "".join(system_parts)},
             {"role": "user",   "content": f"User goal: {user_goal}"},
         ]
 
-    def run(self, user_goal: str) -> CoordinatorResult:
-        history = self._initial_messages(user_goal)
+    def run(
+        self,
+        user_goal: str,
+        *,
+        plan: Plan | None = None,
+        warning: str | None = None,
+    ) -> CoordinatorResult:
+        """Run the delegation loop. If ``plan`` is provided, it is injected into
+        the system prompt as approved guidance; the Coordinator may still
+        deviate if execution surfaces unexpected conditions."""
+        history = self._initial_messages(user_goal, plan=plan, warning=warning)
         used: list[str] = []
         last: dict | None = None
 
         for step in range(self.max_delegations):
-            resp = self.llm.chat(history, json_mode=True, max_tokens=2048)
+            if self.verbose:
+                self.verbose(f"[coordinator] step {step}: thinking…")
+            resp = self.llm.chat(history, json_mode=True, max_tokens=self.max_tokens)
             self.audit.llm_call(
                 messages=history, response=resp,
                 purpose="coordinator",
                 options={"json_mode": True, "step": step},
             )
             if self.verbose:
-                self.verbose(f"[coordinator] step {step}: {(resp.text or '')[:140]}")
+                # Brief summary of what was decided, not the full JSON
+                summary = _coord_decision_summary(resp.text or "")
+                self.verbose(f"[coordinator] step {step}: {summary}")
 
             # Parse decision
             try:
@@ -183,11 +222,39 @@ class Coordinator:
                 "n_steps":         report.get("n_steps"),
             })})
 
-        # Max delegations exhausted
-        self.audit.event("max_delegations", {})
+        # ---- Max delegations exhausted — summarize what we DID learn -----
+        # Pull workspace state to build a "partial results" report so the user
+        # gets something actionable instead of a bare "max reached" message.
+        self.audit.event("max_delegations", {"used": used})
+
+        masks      = sorted(self.workspace.masks)
+        verdicts   = {k: v.get("verdict") for k, v in self.workspace.verdicts.items()}
+        analyses   = sorted(self.workspace.analyses)
+
+        partial_lines = [
+            f"Reached max_delegations={self.max_delegations} without an explicit done.",
+            f"Specialists used: {', '.join(used) or 'none'}.",
+        ]
+        if self.workspace.recon is not None:
+            shape = tuple(self.workspace.recon["xHat"].shape)
+            partial_lines.append(f"Reconstruction loaded (shape {shape}).")
+        if masks:
+            partial_lines.append(f"Masks produced: {masks}.")
+        if verdicts:
+            verdict_summary = ", ".join(f"{k}={v}" for k, v in verdicts.items())
+            partial_lines.append(f"Verifier verdicts: {verdict_summary}.")
+        if analyses:
+            partial_lines.append(f"Hemodynamic reports produced for: {analyses}.")
+        partial_lines.append(
+            "The Coordinator did not converge on a clean result; the most likely "
+            "cause is a data-quality issue (e.g. segmentation cannot cleanly "
+            "isolate a single vessel) rather than an agent bug. The workspace "
+            "state above is preserved — partial results may still be useful."
+        )
+
         return CoordinatorResult(
-            status="max_steps",
-            summary=f"reached max_delegations={self.max_delegations}",
+            status="partial",
+            summary="\n".join(partial_lines),
             n_delegations=self.max_delegations,
             specialists_used=used,
             last_decision=last,

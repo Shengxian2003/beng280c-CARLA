@@ -142,6 +142,30 @@ class TestReconConfig:
 
 # ---------- MATLAB command builder ------------------------------------------
 
+class TestStreamSubprocess:
+    """The on_line callback fires for every subprocess line — used by the agent
+    tool wrapper to show a live elapsed-time counter during long MATLAB runs."""
+
+    def test_on_line_called_per_line(self):
+        from skills.reconstruction._runner import _stream_subprocess
+        captured = []
+        # Cross-platform: use python -c with three prints
+        rc = _stream_subprocess(
+            ["python", "-c", "print('one'); print('two'); print('three')"],
+            verbose=False,
+            on_line=captured.append,
+        )
+        assert rc == 0
+        assert captured == ["one", "two", "three"]
+
+    def test_on_line_optional(self):
+        from skills.reconstruction._runner import _stream_subprocess
+        rc = _stream_subprocess(
+            ["python", "-c", "print('x')"], verbose=False,
+        )
+        assert rc == 0
+
+
 class TestBuildMatlabCmd:
     def test_command_shape(self):
         cmd = _build_matlab_cmd(

@@ -27,6 +27,19 @@ from .project_context import PROJECT_CONTEXT
 from .tools import TOOLS_BY_NAME, ToolSpec, Workspace, call_tool
 
 
+def _short_action_summary(text: str) -> str:
+    """Compress a JSON action into a one-line human summary for the status bar."""
+    try:
+        payload = json.loads(text)
+        if payload.get("done"):
+            return "done — report written"
+        if "tool" in payload:
+            return f"calling {payload['tool']}"
+        return text[:80]
+    except (json.JSONDecodeError, TypeError):
+        return (text or "")[:80].replace("\n", " ")
+
+
 # ============================================================================
 # Specialist
 # ============================================================================
@@ -39,7 +52,12 @@ class Specialist:
     system_prompt: str                # explains role + how to respond
     tool_names: list[str]             # subset of TOOLS_BY_NAME the specialist may call
     llm: LLM
-    max_steps: int = 5                # safety cap on internal tool-calling loop
+    max_steps: int = 20               # safety cap on internal tool-calling loop
+                                      # (was 5 — bumped 4x after Qwen runs showed
+                                      # the segmentation specialist hitting the cap
+                                      # mid-retry on a hard dataset)
+    max_tokens: int = 8192            # was 2048 — Qwen 3.6 reasoning easily eats
+                                      # 500-2000 tokens before the JSON output
     project_context: str = PROJECT_CONTEXT  # canonical paths + acquisition defaults
                                             # injected into the system prompt
 
@@ -102,15 +120,19 @@ class Specialist:
         tools_called: list[str] = []
 
         for step in range(self.max_steps):
+            if verbose_callback:
+                verbose_callback(f"[{self.name}] step {step}: thinking…")
             t0 = time.time()
-            resp = self.llm.chat(history, json_mode=True, max_tokens=2048)
+            resp = self.llm.chat(history, json_mode=True, max_tokens=self.max_tokens)
             audit.llm_call(
                 messages=history, response=resp,
                 purpose=purpose,
                 options={"json_mode": True, "step": step},
             )
             if verbose_callback:
-                verbose_callback(f"[{self.name}] step {step}: {(resp.text or '')[:120]}")
+                # Parse the action so the status text is meaningful, not a JSON blob
+                action_summary = _short_action_summary(resp.text or "")
+                verbose_callback(f"[{self.name}] step {step}: {action_summary}")
 
             # Parse the JSON action
             try:
@@ -250,13 +272,36 @@ Be terse. Quote the iteration count, method, and elapsed time in your report.
 """
 
 
-def build_default_specialists(llm: LLM) -> dict[str, Specialist]:
-    """Construct the four standard specialists, all sharing one LLM backend."""
+RECON_DEMO_MODE_SUFFIX = """\
+
+## DEMO MODE — important constraint
+You are running in demo mode. Fresh MATLAB reconstruction takes ~12 minutes
+and is not available right now: the `reconstruct` tool is removed from your
+toolset. Always use `load_reconstruction` with the existing 5-iter recon.
+If the verifier later flags quality issues, do not request a re-run — let
+the Hemodynamic Analyzer add appropriate caveats to its report.
+"""
+
+
+def build_default_specialists(llm: LLM, *, demo_mode: bool = False) -> dict[str, Specialist]:
+    """Construct the four standard specialists, all sharing one LLM backend.
+
+    Parameters
+    ----------
+    demo_mode : bool
+        When True, the Reconstruction specialist loses access to the
+        ``reconstruct`` tool (MATLAB takes 12 minutes; not suitable for a
+        live demo). It can still call ``load_reconstruction`` to load the
+        existing 5-iter output. The Reconstruction system prompt is updated
+        accordingly so the LLM knows why it can't re-run.
+    """
+    recon_tools = ["load_reconstruction"] if demo_mode else ["load_reconstruction", "reconstruct"]
+    recon_prompt = RECONSTRUCTION_PROMPT + (RECON_DEMO_MODE_SUFFIX if demo_mode else "")
     return {
         "reconstruction": Specialist(
             name="reconstruction",
-            system_prompt=RECONSTRUCTION_PROMPT,
-            tool_names=["load_reconstruction", "reconstruct"],
+            system_prompt=recon_prompt,
+            tool_names=recon_tools,
             llm=llm,
         ),
         "segmentation": Specialist(

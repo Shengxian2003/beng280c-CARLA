@@ -20,6 +20,7 @@ from agents.audit import (
     summarize,
     format_entry,
     pretty_print,
+    extract_thinking_by_agent,
 )
 from agents.llm import LLMResponse
 
@@ -345,3 +346,42 @@ class TestPrettyPrint:
         assert "tool" in captured
         assert "event done" in captured
         assert "session_end" in captured
+
+
+class TestExtractThinking:
+    def test_groups_by_purpose_with_steps(self, tmp_path):
+        log = AuditLog(tmp_path / "s.jsonl")
+        log.llm_call(messages=[], response=_fake_response(text="t1", reasoning="r1"),
+                     purpose="planner")
+        log.llm_call(messages=[], response=_fake_response(text="t2", reasoning="r2"),
+                     purpose="coordinator")
+        log.llm_call(messages=[], response=_fake_response(text="t3", reasoning="r3"),
+                     purpose="coordinator")
+        log.close()
+        by_agent = extract_thinking_by_agent(tmp_path / "s.jsonl")
+        assert set(by_agent) == {"planner", "coordinator"}
+        assert len(by_agent["coordinator"]) == 2
+        assert by_agent["coordinator"][0]["step"] == 0
+        assert by_agent["coordinator"][1]["step"] == 1
+        assert by_agent["coordinator"][0]["reasoning"] == "r2"
+        assert by_agent["coordinator"][1]["reasoning"] == "r3"
+
+    def test_accepts_entries_or_path(self, tmp_path):
+        log = AuditLog(tmp_path / "s.jsonl")
+        log.llm_call(messages=[], response=_fake_response(reasoning="x"),
+                     purpose="planner")
+        log.close()
+        entries = read_log(tmp_path / "s.jsonl")
+        from_entries = extract_thinking_by_agent(entries)
+        from_path    = extract_thinking_by_agent(tmp_path / "s.jsonl")
+        assert from_entries == from_path
+
+    def test_missing_reasoning_stays_none(self, tmp_path):
+        log = AuditLog(tmp_path / "s.jsonl")
+        log.llm_call(messages=[],
+                     response=_fake_response(text="just text", reasoning=None),
+                     purpose="planner")
+        log.close()
+        by_agent = extract_thinking_by_agent(tmp_path / "s.jsonl")
+        assert by_agent["planner"][0]["reasoning"] is None
+        assert by_agent["planner"][0]["text"] == "just text"

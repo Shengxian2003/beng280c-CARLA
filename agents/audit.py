@@ -296,3 +296,37 @@ def pretty_print(path: str | Path, *, max_chars: int = 200) -> None:
     """Dump a log to stdout one line per entry."""
     for e in read_log(path):
         print(format_entry(e, max_chars=max_chars))
+
+
+def extract_thinking_by_agent(entries_or_path) -> dict[str, list[dict]]:
+    """Pull the model's internal chain-of-thought from every LLM call, grouped
+    by ``purpose`` (planner / plan_critic / coordinator / specialist.<name>).
+
+    Returns a dict mapping purpose → list of ``{step, reasoning, text}`` dicts
+    in original call order. ``reasoning`` is whatever the backend exposes
+    (Qwen 3.6's 'thinking' field); ``text`` is the visible reply.
+
+    Useful for post-hoc displays like ``demos/single_window_demo.py``'s
+    "thinking process" summary at the end of a run.
+    """
+    if isinstance(entries_or_path, (str, Path)):
+        entries = read_log(entries_or_path)
+    else:
+        entries = list(entries_or_path)
+
+    by_agent: dict[str, list[dict]] = {}
+    step_counters: dict[str, int] = {}
+    for e in entries:
+        if e["kind"] != "llm_call":
+            continue
+        purpose = e["data"].get("purpose") or "unknown"
+        resp = e["data"].get("response", {})
+        n = step_counters.get(purpose, 0)
+        step_counters[purpose] = n + 1
+        by_agent.setdefault(purpose, []).append({
+            "step":      n,
+            "reasoning": resp.get("reasoning"),
+            "text":      resp.get("text", ""),
+            "latency_ms": resp.get("latency_ms"),
+        })
+    return by_agent

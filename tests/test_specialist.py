@@ -50,6 +50,22 @@ class TestSpecialistConfig:
         specs = build_default_specialists(MockLLM(responses=[]))
         assert specs["verifier"].tool_names == ["verify"]
 
+    def test_demo_mode_removes_reconstruct_tool(self):
+        """In demo mode the Reconstruction specialist must not be able to
+        trigger MATLAB (which would block the demo for ~12 min)."""
+        normal = build_default_specialists(MockLLM(responses=[]))
+        assert "reconstruct" in normal["reconstruction"].tool_names
+
+        demo = build_default_specialists(MockLLM(responses=[]), demo_mode=True)
+        assert "reconstruct" not in demo["reconstruction"].tool_names
+        assert demo["reconstruction"].tool_names == ["load_reconstruction"]
+        # Other specialists unaffected
+        assert demo["segmentation"].tool_names == normal["segmentation"].tool_names
+
+    def test_demo_mode_updates_reconstruction_prompt(self):
+        demo = build_default_specialists(MockLLM(responses=[]), demo_mode=True)
+        assert "DEMO MODE" in demo["reconstruction"].system_prompt
+
 
 # ============================================================================
 # Project context injection — prevents path hallucination
@@ -303,8 +319,10 @@ class TestCoordinator:
         assert result.status == "success"
         assert result.specialists_used == []  # bad delegation didn't run
 
-    def test_max_delegations_caps(self, tmp_path):
+    def test_max_delegations_returns_partial_results(self, tmp_path):
         # Coordinator keeps delegating forever; should bail at max_delegations
+        # and return status='partial' with a summary of what was learned, not
+        # bare 'max_steps'.
         coord_llm, specs = self._make_coord(
             responses=[json.dumps({"delegate_to": "verifier", "task": "x",
                                     "why": "loop"})] * 20,
@@ -316,8 +334,11 @@ class TestCoordinator:
         coord = Coordinator(coord_llm, specs, Workspace(), log, max_delegations=3)
         result = coord.run("test")
         log.close()
-        assert result.status == "max_steps"
+        assert result.status == "partial"
         assert result.n_delegations == 3
+        # Summary should explain what happened
+        assert "max_delegations" in result.summary
+        assert "verifier" in result.summary  # specialists used should be listed
 
     def test_audit_log_records_delegations(self, tmp_path):
         coord_llm, specs = self._make_coord(

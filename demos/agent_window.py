@@ -67,10 +67,23 @@ AGENT_ROUTES: dict[str, Callable[[dict], bool]] = {
         e["kind"] == "session_start"
         or e["kind"] == "session_end"
         or (e["kind"] == "llm_call" and e["data"].get("purpose") == "planner")
+        or (e["kind"] == "event"
+            and e["data"].get("name") in ("planner_parse_failure", "plan_revision"))
+    ),
+    "plan_critic": lambda e: (
+        e["kind"] in ("session_start", "session_end")
+        or (e["kind"] == "llm_call" and e["data"].get("purpose") == "plan_critic")
+        or (e["kind"] == "event"
+            and e["data"].get("name") in ("plan_critic_parse_failure",
+                                            "plan_policy_decision"))
     ),
     "coordinator": lambda e: (
-        e["kind"] in ("session_start", "session_end", "event")
+        e["kind"] in ("session_start", "session_end")
         or (e["kind"] == "llm_call" and e["data"].get("purpose") == "coordinator")
+        or (e["kind"] == "event"
+            and e["data"].get("name") in ("delegation", "coordinator_done",
+                                            "max_delegations", "bad_delegation",
+                                            "orchestrator_error"))
     ),
     "reconstruction": _is_specialist("reconstruction"),
     "segmentation":   _is_specialist("segmentation"),
@@ -81,15 +94,17 @@ AGENT_ROUTES: dict[str, Callable[[dict], bool]] = {
 # Visual identity for each agent window — title bar + accent colour
 AGENT_STYLE: dict[str, dict] = {
     "planner":        {"title": "PLANNER",                  "color": "cyan",
-                       "subtitle": "produces the initial plan"},
+                       "subtitle": "proposes the initial plan from the user goal"},
+    "plan_critic":    {"title": "PLAN CRITIC (LLM Auditor)", "color": "bright_red",
+                       "subtitle": "best-effort review of the plan before execution"},
     "coordinator":    {"title": "COORDINATOR",              "color": "yellow",
-                       "subtitle": "delegates to specialists"},
+                       "subtitle": "delegates the approved plan to specialists"},
     "reconstruction": {"title": "RECONSTRUCTION OPERATOR",  "color": "magenta",
                        "subtitle": "picks recon params; loads or runs MATLAB recon"},
     "segmentation":   {"title": "SEGMENTATION OPERATOR",    "color": "bright_cyan",
                        "subtitle": "picks seeds and percentile; isolates vessels"},
     "verifier":       {"title": "PHYSICS VERIFIER",         "color": "green",
-                       "subtitle": "interprets divergence, flux, peak velocity, phase wrap"},
+                       "subtitle": "DETERMINISTIC — divergence, flux, peak velocity, phase wrap"},
     "hemodynamic":    {"title": "HEMODYNAMIC ANALYZER",     "color": "blue",
                        "subtitle": "interprets Q(t), stroke volume, peak flow physiologically"},
 }
@@ -365,6 +380,37 @@ def _render_event(console, entry):
                         title=f"[dim]{_t(entry)}[/]"))
 
 
+def _render_plan_critic_llm(console, entry):
+    """Render one Plan Critic LLM reply — the structured critique verdict."""
+    d = entry["data"]
+    resp = d.get("response", {})
+    text = resp.get("text") or ""
+    body = Text()
+    try:
+        payload = json.loads(text)
+        verdict = payload.get("verdict", "?")
+        concerns = payload.get("concerns", []) or []
+        suggestions = payload.get("suggestions", "")
+        verdict_color = {"approve": "green", "revise": "yellow",
+                         "reject": "red"}.get(verdict, "white")
+        body.append("Verdict: ", style="dim")
+        body.append(f"{verdict.upper()}\n\n", style=f"bold {verdict_color}")
+        if concerns:
+            body.append("Concerns:\n", style="dim bold")
+            for c in concerns:
+                body.append(f"  • ", style="dim")
+                body.append(_shorten(str(c), 240) + "\n", style="white")
+        if suggestions:
+            body.append("\nSuggestions:\n", style="dim bold")
+            body.append(_shorten(suggestions, 400), style="italic")
+    except json.JSONDecodeError:
+        body.append("[parse failure — soft approved]\n", style="dim italic red")
+        body.append(_shorten(text, 400), style="white")
+    _meta_footer(body, resp)
+    console.print(Panel(body, border_style="bright_red",
+                        title=f"[bold bright_red]plan critique[/]  [dim]{_t(entry)}[/]"))
+
+
 def _short_result(name, result):
     """Compact human summary of a tool result for the coordinator feedback panel."""
     if name == "load_reconstruction":
@@ -409,8 +455,17 @@ def render_entry(console: Console, agent: str, entry: dict):
     if kind == "session_end":
         _render_session_end(console, agent, entry); return
 
-    if agent == "planner" and kind == "llm_call":
-        _render_llm_planner(console, entry); return
+    if agent == "planner":
+        if kind == "llm_call":
+            _render_llm_planner(console, entry); return
+        if kind == "event":
+            _render_event(console, entry); return
+
+    if agent == "plan_critic":
+        if kind == "llm_call":
+            _render_plan_critic_llm(console, entry); return
+        if kind == "event":
+            _render_event(console, entry); return
 
     if agent == "coordinator":
         if kind == "llm_call":

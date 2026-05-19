@@ -46,6 +46,9 @@ from rich.text import Text
 from agents.audit import AuditLog
 from agents.coordinator import Coordinator
 from agents.llm import MockLLM, OllamaLLM
+from agents.plan_critic import PlanCritic
+from agents.plan_policy import PolicyAction, apply_plan_policy
+from agents.planner import Plan, Planner
 from agents.specialist import build_default_specialists
 from agents.tools import Workspace
 
@@ -68,6 +71,34 @@ DEFAULT_GOAL = (
 # strings matching the protocol described in coordinator.py / specialist.py.
 
 MOCK_RESPONSES: list[str] = [
+    # --- Planner: propose the initial plan ---
+    json.dumps({
+        "plan": [
+            {"step": 1, "specialist": "reconstruction",
+             "action": "Load the existing 5-iter CS reconstruction",
+             "success_criterion": "shape matches (77,96,72,20)"},
+            {"step": 2, "specialist": "segmentation",
+             "action": "Segment the largest vessel via PC-MRA seed-based growing",
+             "success_criterion": "mask size > 5000 voxels, peak speed > 0.5 m/s"},
+            {"step": 3, "specialist": "verifier",
+             "action": "Run the four physics checks on the segmented mask",
+             "success_criterion": "report verdict and per-check status to Coordinator"},
+            {"step": 4, "specialist": "hemodynamic",
+             "action": "Compute flow Q(t), stroke volume, peak velocity",
+             "success_criterion": "report falls within physiological ranges or is flagged"},
+        ],
+        "rationale": "Standard pipeline. Loading existing 5-iter recon avoids a 12-min MATLAB run; "
+                     "verifier may flag the under-converged data but hemodynamic specialist will "
+                     "contextualize.",
+    }),
+    # --- Plan Critic: approve ---
+    json.dumps({
+        "verdict": "approve",
+        "concerns": ["minor: rationale acknowledges that 5-iter recon may fail verifier; "
+                     "Coordinator should still proceed and let Hemodynamic Analyzer flag the issue"],
+        "suggestions": "",
+    }),
+
     # --- Coordinator turn 1: delegate to reconstruction ---
     json.dumps({
         "delegate_to": "reconstruction",
@@ -174,15 +205,16 @@ MOCK_RESPONSES: list[str] = [
 # ============================================================================
 
 def _print_instructions(console: Console, log_path: Path):
-    """Show the user which commands to run in each of the six viewer windows."""
+    """Show the user which commands to run in each of the seven viewer windows."""
     body = Text()
-    body.append("Open 6 terminal windows and paste one command into each.\n", style="bold white")
+    body.append("Open 7 terminal windows and paste one command into each.\n", style="bold white")
     body.append("They'll wait for the log file to appear, then stream entries as the agents run.\n\n",
                 style="dim")
 
     activate = "cd ~/projects/medict && conda activate medict"
     cmds = [
-        ("PLANNER (optional)",            "cyan",         "planner"),
+        ("PLANNER",                       "cyan",         "planner"),
+        ("PLAN CRITIC (LLM Auditor)",     "bright_red",   "plan_critic"),
         ("COORDINATOR",                   "yellow",       "coordinator"),
         ("RECONSTRUCTION OPERATOR",       "magenta",      "reconstruction"),
         ("SEGMENTATION OPERATOR",         "bright_cyan",  "segmentation"),
@@ -194,12 +226,71 @@ def _print_instructions(console: Console, log_path: Path):
         body.append(f"  {activate}\n", style="white")
         body.append(f"  python demos/agent_window.py {name} {log_path}\n\n", style="white")
 
-    body.append("Note: the Planner window will be empty in the new architecture — the "
-                "Coordinator does its own planning. You can skip that one.\n", style="dim italic")
-
     console.print(Panel(body, border_style="bold white",
                         title="[bold]Multi-Agent Demo — open viewer windows first[/]",
                         subtitle="[dim]press ENTER here when ready[/]"))
+
+
+def _run_plan_phase(
+    llm,
+    log: AuditLog,
+    user_goal: str,
+    console: Console,
+    *,
+    max_revisions: int = 2,
+) -> tuple[Plan | None, str | None, str | None]:
+    """Planner → Plan Critic → Plan Policy gate.
+
+    Shows a live status spinner while the LLM is thinking; transitions to a
+    permanent printed line whenever a phase finishes. Returns
+    ``(plan, warning_for_coordinator, halt_reason)``.
+    """
+    # Live spinner that updates as each agent acts. The verbose_callback on
+    # Planner and PlanCritic fires both before (thinking…) and after (result).
+    with console.status("[cyan]Planner thinking…[/]", spinner="dots") as status:
+        def update_status(msg: str):
+            status.update(msg)
+
+        planner = Planner(llm, verbose_callback=update_status)
+        critic  = PlanCritic(llm, verbose_callback=update_status)
+
+        plan = planner.propose(user_goal, audit=log)
+    console.print(f"[cyan]✓ planner: proposed plan with {len(plan.steps)} steps[/]")
+
+    for attempt in range(max_revisions + 1):
+        with console.status("[bright_red]Plan Critic reviewing…[/]", spinner="dots") as status:
+            critic.verbose = lambda msg: status.update(msg)
+            critique = critic.review(plan, user_goal=user_goal, audit=log)
+        decision = apply_plan_policy(critique, revision_count=plan.revision_count,
+                                     max_revisions=max_revisions)
+        log.event("plan_policy_decision", {
+            "action":          decision.action.value,
+            "revision_count":  plan.revision_count,
+            "concerns":        decision.concerns,
+            "reason":          decision.reason,
+        })
+        verdict_color = {"approve": "green", "revise": "yellow",
+                         "reject": "red"}.get(critique.verdict, "white")
+        console.print(f"[{verdict_color}]✓ plan critic: {critique.verdict}[/]  "
+                      f"[dim]({decision.action.value})[/]")
+
+        if decision.action == PolicyAction.PROCEED:
+            return plan, None, None
+        if decision.action == PolicyAction.PROCEED_WITH_WARNING:
+            return plan, decision.warning_reason, None
+        if decision.action == PolicyAction.HALT:
+            return None, None, decision.halt_reason
+        if decision.action == PolicyAction.REVISE:
+            log.event("plan_revision", {"revision_count": plan.revision_count + 1,
+                                         "concerns": decision.concerns})
+            with console.status(f"[cyan]Planner revising (round {plan.revision_count + 1})…[/]",
+                                spinner="dots") as status:
+                planner.verbose = lambda msg: status.update(msg)
+                plan = planner.revise(user_goal, plan, decision.concerns, audit=log)
+            console.print(f"[cyan]✓ planner: emitted revision {plan.revision_count}[/]")
+
+    # Shouldn't get here — apply_plan_policy caps at max_revisions
+    return plan, "exited plan loop without an explicit decision", None
 
 
 def _build_llm(backend: str, model: str):
@@ -218,7 +309,12 @@ def main():
                    help="Audit log path (default: logs/agent_demo.jsonl)")
     p.add_argument("--goal", default=DEFAULT_GOAL, help="User goal handed to the Coordinator")
     p.add_argument("--max-delegations", type=int, default=12)
+    p.add_argument("--no-fresh-recon", action="store_true",
+                   help="Disable the Reconstruction specialist's ability to call MATLAB. "
+                        "By default fresh recon is enabled — a live elapsed-time counter "
+                        "in [recon] lines shows MATLAB progress so it doesn't look stuck.")
     args = p.parse_args()
+    demo_mode = args.no_fresh_recon
 
     console = Console()
 
@@ -241,28 +337,62 @@ def main():
         "goal":         args.goal,
         "llm_backend":  args.llm,
         "llm_model":    getattr(llm, "model", "?"),
-        "architecture": "Coordinator + 4 specialists (LLM-pick-LLM)",
+        "architecture": "Planner → PlanCritic → PlanPolicy → Coordinator → 4 specialists",
+        "demo_mode":    demo_mode,
     })
 
-    specialists = build_default_specialists(llm)
-    coord = Coordinator(
-        llm=llm,
-        specialists=specialists,
-        workspace=ws,
-        audit=log,
-        max_delegations=args.max_delegations,
-        verbose_callback=lambda msg: console.print(f"[dim]{msg}[/]"),
-    )
+    if demo_mode:
+        console.print("[dim italic]--no-fresh-recon active: Reconstruction specialist "
+                      "can only load existing recons.[/]\n")
+    else:
+        console.print("[dim italic]Fresh MATLAB reconstruction enabled. If Qwen "
+                      "delegates to it, expect 1–12 min per recon; [recon] lines "
+                      "will show elapsed time + latest MATLAB output.[/]\n")
 
-    # ---- Drive the agent loop --------------------------------------------
+    # ---- Phase 1: Planner + Plan Critic + Plan Policy gate --------------
     try:
-        result = coord.run(args.goal)
+        plan, warning, halt_reason = _run_plan_phase(llm, log, args.goal, console)
+    except Exception as e:
+        log.event("plan_phase_error", {"error_type": type(e).__name__, "msg": str(e)})
+        log.close(status="error", summary={"error": str(e), "phase": "plan"})
+        raise
+
+    if halt_reason is not None:
+        log.close(status="halted_by_plan_critic", summary={
+            "halt_reason": halt_reason,
+            "phase": "plan_critic_rejected",
+        })
+        console.print()
+        console.print(Panel(
+            Text(halt_reason, style="bold red"),
+            title="[bold red]Plan Critic halted execution[/]",
+            subtitle="[dim]see audit log for full critique[/]",
+            border_style="red",
+        ))
+        return
+
+    # ---- Phase 2: Coordinator delegates to specialists ------------------
+    specialists = build_default_specialists(llm, demo_mode=demo_mode)
+
+    try:
+        with console.status("[yellow]Coordinator starting…[/]", spinner="dots") as status:
+            coord = Coordinator(
+                llm=llm,
+                specialists=specialists,
+                workspace=ws,
+                audit=log,
+                max_delegations=args.max_delegations,
+                verbose_callback=lambda msg: status.update(msg),
+            )
+            result = coord.run(args.goal, plan=plan, warning=warning)
         log.close(status=result.status, summary={
             "n_delegations":     result.n_delegations,
             "specialists_used":  result.specialists_used,
             "final_summary":     result.summary,
             "n_masks":           len(ws.masks),
             "verdicts":          {k: v.get("verdict") for k, v in ws.verdicts.items()},
+            "plan_revisions":    plan.revision_count if plan else 0,
+            "plan_warning":      warning,
         })
         console.print()
         console.print(Panel(
@@ -274,7 +404,7 @@ def main():
         ))
     except Exception as e:
         log.event("orchestrator_error", {"error_type": type(e).__name__, "msg": str(e)})
-        log.close(status="error", summary={"error": str(e)})
+        log.close(status="error", summary={"error": str(e), "phase": "coordinator"})
         raise
 
     console.print(f"\n[bold]Audit log:[/] [white]{log_path}[/]")

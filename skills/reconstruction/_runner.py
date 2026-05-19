@@ -67,8 +67,17 @@ def _build_matlab_cmd(matlab_exe: str, driver_dir_win: str, config_path_win: str
     return [matlab_exe, "-batch", batch_body]
 
 
-def _stream_subprocess(cmd: list[str], verbose: bool) -> int:
-    """Run a subprocess, optionally streaming its stdout/stderr live."""
+def _stream_subprocess(cmd: list[str], verbose: bool,
+                       on_line=None) -> int:
+    """Run a subprocess, optionally streaming its stdout/stderr live.
+
+    Parameters
+    ----------
+    on_line : Callable[[str], None] | None
+        Called for every line of subprocess output (after stripping the trailing
+        newline). Useful for showing MATLAB iteration progress in a status bar
+        even when verbose=False.
+    """
     if verbose:
         print(f"$ {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(
@@ -83,6 +92,8 @@ def _stream_subprocess(cmd: list[str], verbose: bool) -> int:
         if verbose:
             sys.stdout.write(line)
             sys.stdout.flush()
+        if on_line is not None:
+            on_line(line.rstrip("\n"))
     proc.wait()
     return proc.returncode
 
@@ -153,6 +164,7 @@ def reconstruct(
     save_preview: bool = True,
     preview_dir: Optional[str | os.PathLike] = None,
     verbose: bool = True,
+    progress_callback=None,
 ) -> dict:
     """Run a CS or CORe reconstruction by invoking Windows MATLAB.
 
@@ -270,7 +282,7 @@ def reconstruct(
     )
 
     t0 = time.time()
-    rc = _stream_subprocess(cmd, verbose=verbose)
+    rc = _stream_subprocess(cmd, verbose=verbose, on_line=progress_callback)
     elapsed_wall = time.time() - t0
 
     if rc != 0:
