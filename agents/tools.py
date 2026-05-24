@@ -298,6 +298,51 @@ def _tool_reconstruct(ws: Workspace, kspace_path: str,
 _RECON_PROGRESS_INTERVAL_S = 3.0
 
 
+# ----- load_phantom (good-case demo) --------------------------------------
+
+def _tool_load_phantom(ws: Workspace,
+                       mask_name: str = "aorta_phantom",
+                       venc_m_per_s: float = 1.5) -> dict:
+    """
+    Load a synthetic curved-tapered "aorta" phantom into the workspace.
+
+    The phantom is a single straight tube along Z with a smooth radius taper
+    (7 → 5 voxels), an incompressible analytically-constructed velocity field
+    (∇·v = 0), and pulsatile cardiac variation. Its ground-truth mask is
+    placed in workspace.masks[mask_name].
+
+    Use this for the "good case" demo: bypasses MATLAB reconstruction and
+    PC-MRA segmentation, exercising only the Physics Verifier and Hemodynamic
+    Analyzer specialists with a known-clean controlled input.
+    """
+    from skills.eval_inject._phantom_v2 import curved_tapered_phantom
+
+    p = curved_tapered_phantom(venc_m_per_s=venc_m_per_s, pulsatile=True)
+    ws.recon = {
+        "thetaX": p["thetaX"],
+        "thetaY": p["thetaY"],
+        "thetaZ": p["thetaZ"],
+        # Placeholder anatomy — verifier/analyzer don't read this, but tools
+        # that call require_recon() check the dict shape.
+        "xHat":   np.ones(p["thetaX"].shape, dtype=np.complex64),
+    }
+    ws.venc_m_per_s    = p["venc_m_per_s"]
+    ws.voxel_size_mm   = p["voxel_size_mm"]
+    ws.dt_seconds      = p["dt_seconds"]
+    ws.suggested_seeds = None
+    ws.masks[mask_name] = p["mask"]
+    return {
+        "status":         "phantom_loaded",
+        "mask_name":      mask_name,
+        "shape_ZYXT":     list(p["thetaX"].shape),
+        "venc_m_per_s":   p["venc_m_per_s"],
+        "voxel_size_mm":  list(p["voxel_size_mm"]),
+        "n_mask_voxels":  int(p["mask"].sum()),
+        "geometry":       p.get("geometry", "tapered_incompressible"),
+        "note":           "ground-truth mask already in workspace; no segmentation needed",
+    }
+
+
 # ----- suggest_seeds -------------------------------------------------------
 
 def _tool_suggest_seeds(ws: Workspace, n_candidates: int = 5,
@@ -425,6 +470,28 @@ TOOLS: list[ToolSpec] = [
             "required": ["mat_path"],
         },
         function=_tool_load_reconstruction,
+    ),
+    ToolSpec(
+        name="load_phantom",
+        description=(
+            "Load a synthetic curved-tapered aorta phantom into the workspace. "
+            "Use this for controlled 'good case' demos: the phantom is a single "
+            "tapered tube along Z with an analytically-constructed incompressible "
+            "velocity field and pulsatile cardiac variation. Ground-truth mask is "
+            "placed in workspace.masks[mask_name] automatically — NO segmentation "
+            "step is required afterward. Designed to pass all 4 Physics Verifier checks."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mask_name":    {"type": "string", "default": "aorta_phantom",
+                                 "description": "Name to store the ground-truth mask under"},
+                "venc_m_per_s": {"type": "number", "default": 1.5,
+                                 "minimum": 0.1, "maximum": 10.0},
+            },
+            "required": [],
+        },
+        function=_tool_load_phantom,
     ),
     ToolSpec(
         name="reconstruct",

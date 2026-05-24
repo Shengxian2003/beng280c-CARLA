@@ -110,7 +110,7 @@ Divergence and flux failures on real data are expected at this stage — both re
 **Date completed:** 2026-05-16
 
 ### Overview
-Python wrapper around the [motion-robust-CMR](https://github.com/OSU-MR/motion-robust-CMR) MATLAB reconstruction (CS / CORe). The interactive `main_recon.m` is replaced by a parameterizable batch driver invoked from Python through Windows MATLAB. The wrapper handles WSL ↔ Windows data staging, JSON config generation, MATLAB invocation, live stdout streaming, and result loading.
+Python wrapper around the [motion-robust-CMR](https://github.com/OSU-MR/motion-robust-CMR) MATLAB reconstruction (CS / CORe) from Arshad et al., *Magn Reson Med* 2024 ([doi:10.1002/mrm.30123](https://doi.org/10.1002/mrm.30123)). The interactive `main_recon.m` is replaced by a parameterizable batch driver invoked from Python through Windows MATLAB. The wrapper handles WSL ↔ Windows data staging, JSON config generation, MATLAB invocation, live stdout streaming, and result loading.
 
 ### Files
 | File | Description |

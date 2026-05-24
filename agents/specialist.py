@@ -283,7 +283,30 @@ the Hemodynamic Analyzer add appropriate caveats to its report.
 """
 
 
-def build_default_specialists(llm: LLM, *, demo_mode: bool = False) -> dict[str, Specialist]:
+RECON_PHANTOM_MODE_SUFFIX = """\
+
+## PHANTOM MODE — important constraint
+You are running in phantom mode. Instead of loading or reconstructing real
+data, you should call `load_phantom` to load a synthetic curved-tapered
+aorta phantom with a known ground-truth mask. The phantom is designed to
+pass all 4 Physics Verifier checks. The mask is placed in the workspace
+automatically — the Segmentation Operator will see it already exists.
+"""
+
+SEG_PHANTOM_MODE_SUFFIX = """\
+
+## PHANTOM MODE — important constraint
+A ground-truth phantom mask has been loaded into the workspace by the
+Reconstruction Operator (typically named 'aorta_phantom'). You do NOT need
+to run seed-based segmentation. Your report should confirm the mask is
+present in the workspace and pass it through to the Verifier by name.
+You may skip calling any segmentation tools.
+"""
+
+
+def build_default_specialists(llm: LLM, *,
+                              demo_mode: bool = False,
+                              phantom_mode: bool = False) -> dict[str, Specialist]:
     """Construct the four standard specialists, all sharing one LLM backend.
 
     Parameters
@@ -291,12 +314,28 @@ def build_default_specialists(llm: LLM, *, demo_mode: bool = False) -> dict[str,
     demo_mode : bool
         When True, the Reconstruction specialist loses access to the
         ``reconstruct`` tool (MATLAB takes 12 minutes; not suitable for a
-        live demo). It can still call ``load_reconstruction`` to load the
-        existing 5-iter output. The Reconstruction system prompt is updated
-        accordingly so the LLM knows why it can't re-run.
+        live demo). It can still call ``load_reconstruction``.
+    phantom_mode : bool
+        When True, the Reconstruction specialist gains access to
+        ``load_phantom`` and is told to use it. The Segmentation specialist
+        is told the mask already exists and to skip its tools. Used for the
+        controlled "good case" demo.
     """
-    recon_tools = ["load_reconstruction"] if demo_mode else ["load_reconstruction", "reconstruct"]
-    recon_prompt = RECONSTRUCTION_PROMPT + (RECON_DEMO_MODE_SUFFIX if demo_mode else "")
+    # Reconstruction tool list
+    if phantom_mode:
+        recon_tools  = ["load_phantom"]
+        recon_prompt = RECONSTRUCTION_PROMPT + RECON_PHANTOM_MODE_SUFFIX
+    elif demo_mode:
+        recon_tools  = ["load_reconstruction"]
+        recon_prompt = RECONSTRUCTION_PROMPT + RECON_DEMO_MODE_SUFFIX
+    else:
+        recon_tools  = ["load_reconstruction", "reconstruct"]
+        recon_prompt = RECONSTRUCTION_PROMPT
+
+    # Segmentation prompt (tool list unchanged — even in phantom mode it
+    # could fall back to seed-based, but the prompt steers it not to)
+    seg_prompt = SEGMENTATION_PROMPT + (SEG_PHANTOM_MODE_SUFFIX if phantom_mode else "")
+
     return {
         "reconstruction": Specialist(
             name="reconstruction",
@@ -306,7 +345,7 @@ def build_default_specialists(llm: LLM, *, demo_mode: bool = False) -> dict[str,
         ),
         "segmentation": Specialist(
             name="segmentation",
-            system_prompt=SEGMENTATION_PROMPT,
+            system_prompt=seg_prompt,
             tool_names=["suggest_seeds", "segment_from_seed"],
             llm=llm,
         ),

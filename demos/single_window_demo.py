@@ -313,6 +313,10 @@ def main():
                    help="Audit log path (default: logs/single_window_demo.jsonl)")
     p.add_argument("--goal", default=DEFAULT_GOAL)
     p.add_argument("--max-delegations", type=int, default=12)
+    p.add_argument("--max-plan-revisions", type=int, default=0,
+                   help="Max times Planner can rewrite its plan after Critic feedback. "
+                        "Default 0 = accept first plan (avoids Qwen 'forgot JSON' crashes "
+                        "on long revision reasoning chains).")
     p.add_argument("--no-fresh-recon", action="store_true",
                    help="Disable the Reconstruction specialist's MATLAB tool. "
                         "If you keep MATLAB enabled, [recon] elapsed-time lines "
@@ -354,7 +358,8 @@ def main():
 
     # ---- Phase 1 + 2 (plan + critic + policy) ----------------------------
     try:
-        plan, warning, halt_reason = _run_plan_phase_inline(llm, log, args.goal, console)
+        plan, warning, halt_reason = _run_plan_phase_inline(llm, log, args.goal, console,
+                                                              max_revisions=args.max_plan_revisions)
     except Exception as e:
         log.event("plan_phase_error", {"error_type": type(e).__name__, "msg": str(e)})
         log.close(status="error", summary={"error": str(e), "phase": "plan"})

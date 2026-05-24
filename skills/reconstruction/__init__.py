@@ -8,6 +8,8 @@ Helpers (mostly for tests and advanced use):
     to_windows_for_matlab(path)
     to_wsl(path)
 """
+from __future__ import annotations
+
 from ._runner import reconstruct, ReconConfig, DEFAULT_MATLAB_EXE, DEFAULT_STAGE_DIR
 from ._paths import to_windows_for_matlab, to_wsl, wsl_to_unc, mnt_to_windows
 from ._preview import save_preview

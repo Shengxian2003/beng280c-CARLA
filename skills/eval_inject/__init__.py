@@ -13,6 +13,8 @@ Public API:
     inject_peak_velocity(vx, vy, vz, mask, target_peak_m_per_s=...)
     inject_phase_wrap(thetaX, thetaY, thetaZ, mask, fraction=...)
 """
+from __future__ import annotations
+
 from ._phantom import clean_flow_phantom, velocity_to_phase
 from ._injectors import (
     inject_divergence,

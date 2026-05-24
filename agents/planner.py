@@ -18,11 +18,51 @@ Design notes:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from .audit import AuditLog
+
+
+def _extract_json_object(text: str) -> dict:
+    """Pull the first valid top-level JSON object out of an LLM reply.
+
+    Handles common LLM noise: markdown code fences, prose preamble, trailing
+    explanation, multi-line indented JSON. Raises if no parseable object found.
+    """
+    if not text or not text.strip():
+        raise json.JSONDecodeError("empty response from LLM", text or "", 0)
+
+    # Fast path: clean JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strip markdown code fence if present
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Find first '{' and try progressively shorter slices ending at '}'
+    start = text.find("{")
+    if start >= 0:
+        decoder = json.JSONDecoder()
+        try:
+            obj, _ = decoder.raw_decode(text[start:])
+            return obj
+        except json.JSONDecodeError:
+            pass
+
+    # Give up — raise the canonical error
+    raise json.JSONDecodeError(
+        "no parseable JSON object in LLM reply", text, 0
+    )
 from .llm import LLM
 from .project_context import PROJECT_CONTEXT
 
@@ -83,8 +123,8 @@ class Plan:
 
     @classmethod
     def from_llm_text(cls, text: str) -> "Plan":
-        """Parse the LLM's JSON output into a Plan. Raises on bad shape."""
-        payload = json.loads(text)
+        """Parse the LLM's JSON output into a Plan. Tolerant to surrounding prose / markdown."""
+        payload = _extract_json_object(text)
         steps = payload.get("plan")
         if not isinstance(steps, list) or not steps:
             raise ValueError(f"plan must be a non-empty list, got: {steps!r}")
