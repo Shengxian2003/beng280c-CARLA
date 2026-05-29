@@ -106,8 +106,8 @@ def curved_tapered_phantom(
         vz[..., t] = vz_smooth * cardiac[t]
 
     peak = np.sqrt(vx**2 + vy**2 + vz**2).max()
-    print(f"  实际峰值速度: {peak:.3f} m/s  "
-          f"({'✓ OK' if peak < venc_m_per_s else '⚠ 接近/超 VENC'})")
+    print(f"  Peak speed:  {peak:.3f} m/s  "
+          f"({'OK' if peak < venc_m_per_s else 'near/above VENC'})")
 
     # ── 5. 速度 → 相位 ───────────────────────────────────────
     s = np.pi / venc_m_per_s

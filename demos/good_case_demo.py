@@ -234,6 +234,10 @@ def _print_final_panel(console: Console, workspace: Workspace) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="MEDICT Good Case Demo (phantom)")
     p.add_argument("--llm", choices=["mock", "ollama"], default="ollama")
+    p.add_argument("--model", default="qwen3.6",
+                   help="Ollama model name (ignored for --llm mock)")
+    p.add_argument("--llm-host", default=None,
+                   help="Override Ollama host URL (default: localhost:11434)")
     p.add_argument("--goal", default=PHANTOM_GOAL)
     p.add_argument("--log", default="logs/good_case_demo.jsonl")
     p.add_argument("--napari", action="store_true",
@@ -253,7 +257,8 @@ def main() -> None:
     if args.llm == "mock":
         llm = MockLLM(MOCK_RESPONSES)
     else:
-        llm = OllamaLLM(model="qwen3.6")
+        llm = OllamaLLM(model=args.model,
+                        host=args.llm_host or "http://localhost:11434")
 
     # ── Pipeline ────────────────────────────────────────────────
     workspace = Workspace()

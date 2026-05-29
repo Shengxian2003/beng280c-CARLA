@@ -37,6 +37,7 @@ from agents.plan_critic import PlanCritic
 from agents.plan_policy import PolicyAction, apply_plan_policy
 from agents.planner import Plan, Planner
 from agents.specialist import build_default_specialists
+from agents.summarizer import Summarizer
 from agents.tools import Workspace
 
 # Reuse the canonical goal + mock script from run_demo.py
@@ -293,10 +294,43 @@ def _run_plan_phase_inline(llm, log, user_goal, console, max_revisions=2):
     return plan, "exited plan loop without explicit decision", None
 
 
-def _build_llm(backend, model):
+def _build_llm(backend, model, host=None):
     if backend == "mock":
         return MockLLM(responses=MOCK_RESPONSES)
-    return OllamaLLM(model=model)
+    return OllamaLLM(model=model, host=host or "http://localhost:11434")
+
+
+def _extract_per_agent_reports(log_path) -> dict[str, str]:
+    """For each agent (purpose), pull the 'report'/'summary' field from its
+    most recent llm_call entry. Empty if the agent never ran."""
+    out: dict[str, str] = {}
+    if not Path(log_path).exists():
+        return out
+    last_text: dict[str, str] = {}
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("kind") != "llm_call":
+                continue
+            d   = e["data"]
+            p   = d.get("purpose")
+            txt = (d.get("response") or {}).get("text") or ""
+            if p and txt:
+                last_text[p] = txt
+    for purpose, text in last_text.items():
+        try:
+            payload = json.loads(text)
+            out[purpose] = (
+                payload.get("report")
+                or payload.get("summary")
+                or json.dumps(payload, indent=2)
+            )
+        except json.JSONDecodeError:
+            out[purpose] = text
+    return out
 
 
 # ============================================================================
@@ -308,7 +342,10 @@ def main():
         description="Single-terminal multi-agent demo. All agents print inline; "
                     "thinking summary at the end.")
     p.add_argument("--llm", choices=["ollama", "mock"], default="ollama")
-    p.add_argument("--model", default="qwen3.6")
+    p.add_argument("--model", default="qwen3.6",
+                   help="Ollama model name (qwen3.6, qwen2.5:7b-instruct, ...)")
+    p.add_argument("--llm-host", default=None,
+                   help="Override LLM host (default: localhost:11434 for ollama)")
     p.add_argument("--log-path", default=None,
                    help="Audit log path (default: logs/single_window_demo.jsonl)")
     p.add_argument("--goal", default=DEFAULT_GOAL)
@@ -321,8 +358,21 @@ def main():
                    help="Disable the Reconstruction specialist's MATLAB tool. "
                         "If you keep MATLAB enabled, [recon] elapsed-time lines "
                         "will print to stderr during the call.")
+    p.add_argument("--phantom", action="store_true",
+                   help="Use the built-in synthetic phantom as input instead of "
+                        "a real .mat reconstruction. Reconstruction specialist "
+                        "gets the `load_phantom` tool; segmentation passthrough.")
     args = p.parse_args()
-    demo_mode = args.no_fresh_recon
+    demo_mode    = args.no_fresh_recon
+    phantom_mode = args.phantom
+    if phantom_mode and args.goal == DEFAULT_GOAL:
+        # Auto-rewrite the default real-scan goal so the agent knows to use phantom
+        args.goal = (
+            "Analyze the built-in synthetic curved-tapered aorta phantom "
+            "(VENC=1.5 m/s, voxel 2mm). Load it via load_phantom — the "
+            "ground-truth mask is placed in the workspace automatically. "
+            "Skip segmentation, verify the physics, and report flow metrics."
+        )
 
     console = Console()
     log_path = Path(args.log_path) if args.log_path else Path("logs") / "single_window_demo.jsonl"
@@ -345,7 +395,7 @@ def main():
                       "calls it, expect 1–12 min with live [recon] elapsed-time "
                       "lines on stderr.[/]")
 
-    llm = _build_llm(args.llm, args.model)
+    llm = _build_llm(args.llm, args.model, host=args.llm_host)
     ws = Workspace()
     log = AuditLog(log_path, session_metadata={
         "goal":         args.goal,
@@ -353,6 +403,7 @@ def main():
         "llm_model":    getattr(llm, "model", "?"),
         "architecture": "Planner → PlanCritic → Coordinator → 4 specialists",
         "view":         "single_window",
+        "phantom_mode": phantom_mode,
         "demo_mode":    demo_mode,
     })
 
@@ -382,7 +433,9 @@ def main():
     # ---- Phase 3 (Coordinator + specialists) -----------------------------
     _section_header(console, "COORDINATOR", "yellow")
 
-    specialists = build_default_specialists(llm, demo_mode=demo_mode)
+    specialists = build_default_specialists(
+        llm, demo_mode=demo_mode, phantom_mode=phantom_mode,
+    )
     coord = Coordinator(
         llm=llm, specialists=specialists, workspace=ws, audit=log,
         max_delegations=args.max_delegations,
@@ -391,10 +444,39 @@ def main():
 
     try:
         result = coord.run(args.goal, plan=plan, warning=warning)
+
+        # ── Phase 4: Summary Agent ──────────────────────────────────
+        # Read what each agent contributed and produce a unified summary.
+        _section_header(console, "SUMMARY AGENT", "white")
+        per_agent_reports = _extract_per_agent_reports(log_path)
+        workspace_state   = {
+            "n_masks":  len(ws.masks),
+            "masks":    sorted(ws.masks),
+            "verdicts": {k: v.get("verdict") for k, v in ws.verdicts.items()},
+            "analyses": {k: (v.get("summary", {}) if isinstance(v, dict) else None)
+                         for k, v in ws.analyses.items()},
+        }
+        try:
+            summary_text = Summarizer(llm).summarize(
+                user_goal=args.goal,
+                coordinator_summary=result.summary,
+                coordinator_status=result.status,
+                per_agent_reports=per_agent_reports,
+                workspace_state=workspace_state,
+                audit=log,
+                verbose_callback=_make_inline_callback(console, "white"),
+            )
+            console.print(Panel(Text(summary_text), border_style="white",
+                                title="[bold]Pipeline summary (from Summary Agent)[/]"))
+        except Exception as e:
+            console.print(f"[dim red]Summary agent failed: {e}[/]")
+            summary_text = ""
+
         log.close(status=result.status, summary={
             "n_delegations":     result.n_delegations,
             "specialists_used":  result.specialists_used,
             "final_summary":     result.summary,
+            "summary_agent_text": summary_text,
             "n_masks":           len(ws.masks),
             "verdicts":          {k: v.get("verdict") for k, v in ws.verdicts.items()},
             "plan_revisions":    plan.revision_count,

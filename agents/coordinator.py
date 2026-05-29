@@ -156,14 +156,100 @@ class Coordinator:
         used: list[str] = []
         last: dict | None = None
 
+        # Pipeline progress tracker — visible to the LLM in every energy block
+        STAGES = ["reconstruction", "segmentation", "verifier", "hemodynamic"]
+        stage_status: dict[str, str] = {s: "pending" for s in STAGES}
+
+        def _refresh_stage_status() -> None:
+            """Snapshot what the workspace currently shows."""
+            if self.workspace.recon is not None:
+                stage_status["reconstruction"] = "ok"
+            if self.workspace.masks:
+                stage_status["segmentation"]   = "ok"
+            if self.workspace.verdicts:
+                # any verify call ran (pass/warn/fail all count as "done")
+                stage_status["verifier"]       = "ok"
+            if self.workspace.analyses:
+                stage_status["hemodynamic"]    = "ok"
+
         for step in range(self.max_delegations):
+            _refresh_stage_status()
+            # ── Inject a live energy block so the LLM sees its delegation budget
+            remaining = self.max_delegations - step
+            is_final  = (remaining == 1)
+            # Detailed stage status: explicitly marked PENDING when missing,
+            # so the LLM cannot pretend a stage is done from a text report alone.
+            stage_truth_lines = []
+            for s in STAGES:
+                if stage_status[s] == "ok":
+                    stage_truth_lines.append(f"  - {s}: ✓ DONE (verified in workspace)")
+                else:
+                    stage_truth_lines.append(f"  - {s}: ✗ NOT YET DONE (workspace is empty)")
+            stage_block = "\n".join(stage_truth_lines)
+            untouched = [s for s in STAGES if stage_status[s] != "ok"]
+
+            ground_truth_warning = (
+                "⚠ GROUND TRUTH: the workspace state above is the ONLY authoritative "
+                "record of what has happened. Specialists' natural-language reports may "
+                "claim work was done when it wasn't (e.g., a specialist may say "
+                "'verified the physics' without the Verifier specialist actually running). "
+                "A stage is only DONE when the workspace shows it (mask, verdict, or "
+                "analysis exists). If the Verifier hasn't run, you MUST delegate to it "
+                "before emitting done."
+            )
+
+            if is_final:
+                energy_msg = (
+                    "[ENERGY] ⚠ FINAL DELEGATION — this is your last chance.\n"
+                    f"Pipeline progress (workspace state):\n{stage_block}\n\n"
+                    f"{ground_truth_warning}\n\n"
+                    "Your next reply MUST be done=true with a best-effort summary. "
+                    "After this round the loop terminates regardless of what you emit."
+                )
+            else:
+                hint = ""
+                if remaining <= 3 and untouched:
+                    hint = (
+                        f"\n⚠ Budget is low ({remaining} left). Stages NOT YET DONE: "
+                        f"{untouched}. PRIORITIZE delegating to the next pending stage. "
+                        f"A degraded mask + caveated hemodynamic report is better than "
+                        f"hitting the limit with no downstream stage attempted."
+                    )
+                energy_msg = (
+                    f"[ENERGY] You have {remaining}/{self.max_delegations} delegations "
+                    f"remaining.\n"
+                    f"Pipeline progress (workspace state):\n{stage_block}\n\n"
+                    f"{ground_truth_warning}\n"
+                    f"Every reply (delegate or done) consumes 1 delegation."
+                    f"{hint}"
+                )
+            # Replace any prior [ENERGY] block on the last user turn
+            if history and history[-1].get("role") == "user":
+                content = history[-1]["content"] or ""
+                marker  = "\n\n[ENERGY]"
+                idx     = content.rfind(marker)
+                if idx >= 0:
+                    content = content[:idx]
+                history[-1]["content"] = content + "\n\n" + energy_msg
+
             if self.verbose:
-                self.verbose(f"[coordinator] step {step}: thinking…")
+                self.verbose(
+                    f"[coordinator] step {step}: deciding "
+                    f"(delegations {remaining}/{self.max_delegations})"
+                )
             resp = self.llm.chat(history, json_mode=True, max_tokens=self.max_tokens)
             self.audit.llm_call(
                 messages=history, response=resp,
                 purpose="coordinator",
-                options={"json_mode": True, "step": step},
+                options={
+                    "json_mode": True, "step": step,
+                    "budget": {
+                        "delegations_used":      step,
+                        "max_delegations":       self.max_delegations,
+                        "delegations_remaining": remaining,
+                        "is_final_round":        is_final,
+                    },
+                },
             )
             if self.verbose:
                 # Brief summary of what was decided, not the full JSON
