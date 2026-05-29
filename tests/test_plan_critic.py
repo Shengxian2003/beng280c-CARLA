@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from agents.audit import AuditLog, read_log, filter_log
-from agents.llm import MockLLM
+from utility.audit import AuditLog, read_log, filter_log
+from utility.llm import MockLLM
 from agents.plan_critic import PlanCritic, PlanCritique
 from agents.planner import Plan
 

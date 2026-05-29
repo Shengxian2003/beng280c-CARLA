@@ -30,15 +30,16 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from agents.audit import AuditLog, extract_thinking_by_agent
+from utility.audit import AuditLog, extract_thinking_by_agent
 from agents.coordinator import Coordinator
-from agents.llm import MockLLM, OllamaLLM
+from utility.llm import MockLLM, OllamaLLM
 from agents.plan_critic import PlanCritic
-from agents.plan_policy import PolicyAction, apply_plan_policy
+from utility.plan_policy import PolicyAction, apply_plan_policy
 from agents.planner import Plan, Planner
+from utility.input_modes import REGISTRY, InputMode, get_profile, with_no_fresh_recon
 from agents.specialist import build_default_specialists
 from agents.summarizer import Summarizer
-from agents.tools import Workspace
+from utility.tools import Workspace
 
 # Reuse the canonical goal + mock script from run_demo.py
 from demos.run_demo import DEFAULT_GOAL, MOCK_RESPONSES
@@ -358,21 +359,34 @@ def main():
                    help="Disable the Reconstruction specialist's MATLAB tool. "
                         "If you keep MATLAB enabled, [recon] elapsed-time lines "
                         "will print to stderr during the call.")
+    _input_choices = [p.cli_flag for p in REGISTRY.values()]
+    p.add_argument("--input-mode", choices=_input_choices, default=None,
+                   help=f"Which input the pipeline should set up for. "
+                        f"Choices: {_input_choices}. Each mode gets exactly "
+                        f"the loaders it needs; other loaders are invisible to "
+                        f"the recon specialist by construction.")
     p.add_argument("--phantom", action="store_true",
-                   help="Use the built-in synthetic phantom as input instead of "
-                        "a real .mat reconstruction. Reconstruction specialist "
-                        "gets the `load_phantom` tool; segmentation passthrough.")
+                   help="DEPRECATED — equivalent to --input-mode phantom. "
+                        "Kept for backward compatibility.")
     args = p.parse_args()
-    demo_mode    = args.no_fresh_recon
-    phantom_mode = args.phantom
-    if phantom_mode and args.goal == DEFAULT_GOAL:
-        # Auto-rewrite the default real-scan goal so the agent knows to use phantom
-        args.goal = (
-            "Analyze the built-in synthetic curved-tapered aorta phantom "
-            "(VENC=1.5 m/s, voxel 2mm). Load it via load_phantom — the "
-            "ground-truth mask is placed in the workspace automatically. "
-            "Skip segmentation, verify the physics, and report flow metrics."
-        )
+    demo_mode = args.no_fresh_recon
+
+    # Resolve input profile: --input-mode wins, --phantom is a legacy shortcut,
+    # otherwise default to REAL_SCAN.
+    if args.input_mode is not None:
+        profile = get_profile(args.input_mode)
+    elif args.phantom:
+        profile = REGISTRY[InputMode.PHANTOM]
+    else:
+        profile = REGISTRY[InputMode.REAL_SCAN]
+    if demo_mode:
+        profile = with_no_fresh_recon(profile)
+
+    # If the user did not pass an explicit --goal, build it from the profile.
+    if args.goal == DEFAULT_GOAL:
+        templated = profile.goal_template({"custom_goal": None})
+        if templated:
+            args.goal = templated
 
     console = Console()
     log_path = Path(args.log_path) if args.log_path else Path("logs") / "single_window_demo.jsonl"
@@ -403,7 +417,7 @@ def main():
         "llm_model":    getattr(llm, "model", "?"),
         "architecture": "Planner → PlanCritic → Coordinator → 4 specialists",
         "view":         "single_window",
-        "phantom_mode": phantom_mode,
+        "input_mode":   profile.cli_flag,
         "demo_mode":    demo_mode,
     })
 
@@ -433,9 +447,7 @@ def main():
     # ---- Phase 3 (Coordinator + specialists) -----------------------------
     _section_header(console, "COORDINATOR", "yellow")
 
-    specialists = build_default_specialists(
-        llm, demo_mode=demo_mode, phantom_mode=phantom_mode,
-    )
+    specialists = build_default_specialists(llm, input_profile=profile)
     coord = Coordinator(
         llm=llm, specialists=specialists, workspace=ws, audit=log,
         max_delegations=args.max_delegations,

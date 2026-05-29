@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 import streamlit as st
 
+from utility.input_modes import REGISTRY, InputMode, get_profile
 from ui._widgets.pipeline_panel import PipelineState, render_pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Config + result types
 # ─────────────────────────────────────────────────────────────────────
 
+# InputType mirrors agents.input_modes.InputMode for UI-side typing. The
+# string values MUST match `profile.cli_flag` for each mode in the registry
+# (the runner passes `cfg.input_type.value` directly via --input-mode).
 class InputType(str, Enum):
     REAL_SCAN = "real_scan"
     PHANTOM   = "phantom"
@@ -60,66 +64,55 @@ class RunResult:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Goal templates + command construction
+# Command construction — the goal text is built by the input-mode profile
+# (see agents/input_modes.py); the runner only translates RunConfig into a
+# subprocess argv.
 # ─────────────────────────────────────────────────────────────────────
 
-REAL_SCAN_GOAL_TEMPLATE = (
-    "Analyze the hemodynamics of the 4D flow MRI scan at {path}. "
-    "VENC = {venc} m/s, voxel size {vox} mm isotropic. "
-    "Pick a vessel, verify the physics, and report flow metrics. "
-    "If verification fails, explain why and what should be done next."
-)
-
-
 def build_goal(cfg: RunConfig) -> str:
-    if cfg.custom_goal:
-        return cfg.custom_goal
-    if cfg.input_type == InputType.REAL_SCAN:
-        return REAL_SCAN_GOAL_TEMPLATE.format(
-            path=cfg.scan_path, venc=cfg.venc_m_per_s, vox=cfg.voxel_size_mm,
-        )
-    return ""
+    """Build the user-facing goal for `cfg` using the registered profile."""
+    profile = get_profile(cfg.input_type.value)
+    return profile.goal_template({
+        "custom_goal":   cfg.custom_goal,
+        "scan_path":     cfg.scan_path,
+        "venc_m_per_s":  cfg.venc_m_per_s,
+        "voxel_size_mm": cfg.voxel_size_mm,
+    })
 
 
 def _build_command(cfg: RunConfig) -> tuple[list[str], Path]:
     """
-    Both phantom and real-scan go through the SAME generic pipeline script
-    (single_window_demo.py). The only thing that changes is the input source
-    flag and the goal — the LLM is always live, never scripted.
+    All input modes route through the SAME generic pipeline script
+    (single_window_demo.py). What changes is `--input-mode <flag>` and the
+    goal — the LLM is always live, never scripted.
     """
-    python = sys.executable
+    python  = sys.executable
+    profile = get_profile(cfg.input_type.value)
 
-    if cfg.input_type == InputType.PHANTOM:
-        log_path = PROJECT_ROOT / "logs" / "ui_phantom.jsonl"
-        argv = [
-            python, "demos/single_window_demo.py",
-            "--llm",   cfg.llm_backend,
-            "--model", cfg.llm_model,
-            "--phantom",
-            "--max-plan-revisions", str(cfg.max_plan_revisions),
-            "--max-delegations",    str(cfg.max_delegations),
-            "--log-path",           str(log_path),
-        ]
-        if cfg.custom_goal:
-            argv += ["--goal", cfg.custom_goal]
-        return argv, log_path
+    if cfg.input_type == InputType.REAL_SCAN and not cfg.scan_path:
+        raise ValueError("REAL_SCAN requires scan_path")
 
+    # Per-mode log path so simultaneous runs / replays don't collide
     if cfg.input_type == InputType.REAL_SCAN:
-        if not cfg.scan_path:
-            raise ValueError("REAL_SCAN requires scan_path")
         log_path = PROJECT_ROOT / "logs" / f"ui_real_{Path(cfg.scan_path).stem}.jsonl"
-        return [
-            python, "demos/single_window_demo.py",
-            "--llm",   cfg.llm_backend,
-            "--model", cfg.llm_model,
-            "--no-fresh-recon",
-            "--max-plan-revisions", str(cfg.max_plan_revisions),
-            "--max-delegations",    str(cfg.max_delegations),
-            "--log-path",           str(log_path),
-            "--goal",               build_goal(cfg),
-        ], log_path
+    else:
+        log_path = PROJECT_ROOT / "logs" / f"ui_{cfg.input_type.value}.jsonl"
 
-    raise ValueError(f"unsupported input_type {cfg.input_type}")
+    argv = [
+        python, "demos/single_window_demo.py",
+        "--llm",          cfg.llm_backend,
+        "--model",        cfg.llm_model,
+        "--input-mode",   profile.cli_flag,
+        "--max-plan-revisions", str(cfg.max_plan_revisions),
+        "--max-delegations",    str(cfg.max_delegations),
+        "--log-path",           str(log_path),
+        "--goal",               build_goal(cfg),
+    ]
+    # Real-scan loads existing .mat (don't trigger MATLAB) — preserved behavior
+    if cfg.input_type == InputType.REAL_SCAN:
+        argv.append("--no-fresh-recon")
+
+    return argv, log_path
 
 
 # ─────────────────────────────────────────────────────────────────────

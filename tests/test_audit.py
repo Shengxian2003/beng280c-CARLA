@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from agents.audit import (
+from utility.audit import (
     AuditLog,
     read_log,
     iter_log,
@@ -22,7 +22,7 @@ from agents.audit import (
     pretty_print,
     extract_thinking_by_agent,
 )
-from agents.llm import LLMResponse
+from utility.llm import LLMResponse
 
 
 # ============================================================================

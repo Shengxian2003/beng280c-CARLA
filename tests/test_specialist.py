@@ -9,10 +9,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from agents.audit import AuditLog, read_log, filter_log
+from utility.audit import AuditLog, read_log, filter_log
 from agents.coordinator import Coordinator
-from agents.llm import MockLLM
-from agents.project_context import (
+from utility.llm import MockLLM
+from utility.project_context import (
     PROJECT_CONTEXT,
     KSPACE_PATH,
     EXISTING_RECON_5ITER,
@@ -22,7 +22,7 @@ from agents.specialist import (
     build_default_specialists,
     VERIFIER_PROMPT,
 )
-from agents.tools import Workspace
+from utility.tools import Workspace
 
 
 # ============================================================================
@@ -142,7 +142,7 @@ class TestSpecialistHandle:
             system_prompt="You are a test specialist.",
             tool_names=tools,
             llm=llm,
-            max_steps=4,
+            max_rounds=4,
         )
 
     def test_done_in_one_step(self, tmp_path):
@@ -221,8 +221,8 @@ class TestSpecialistHandle:
         assert report["done"] is True
         assert "recovered" in report["report"]
 
-    def test_max_steps_cap(self, tmp_path):
-        # Never says done → should bail after max_steps with a partial report
+    def test_max_rounds_cap(self, tmp_path):
+        # Never says done → should bail after max_rounds with a partial report
         s = self._make(
             responses=[json.dumps({"tool": "verify", "args": {"mask_name": "nope"}})] * 10,
             tools=["verify"],
@@ -231,7 +231,7 @@ class TestSpecialistHandle:
         report = s.handle("task", workspace=Workspace(), audit=log)
         log.close()
         assert report["done"] is False
-        assert "did not produce a report" in report["report"]
+        assert "exhausted" in report["report"]
 
     def test_llm_calls_tagged_with_specialist_purpose(self, tmp_path):
         # The audit purpose must be "specialist.<name>" so the viewer windows can filter
@@ -266,7 +266,7 @@ class TestCoordinator:
                 system_prompt=f"You are the test {name} specialist.",
                 tool_names=[],   # don't run any tools — just emit done immediately
                 llm=spec_llm,
-                max_steps=3,
+                max_rounds=3,
             )
         return coord_llm, specialists
 
@@ -322,7 +322,7 @@ class TestCoordinator:
     def test_max_delegations_returns_partial_results(self, tmp_path):
         # Coordinator keeps delegating forever; should bail at max_delegations
         # and return status='partial' with a summary of what was learned, not
-        # bare 'max_steps'.
+        # bare 'max_rounds'.
         coord_llm, specs = self._make_coord(
             responses=[json.dumps({"delegate_to": "verifier", "task": "x",
                                     "why": "loop"})] * 20,

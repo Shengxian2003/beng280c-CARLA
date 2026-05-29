@@ -291,8 +291,8 @@ class TestRendering:
 
 class TestTailLog:
     def _populate(self, path):
-        from agents.audit import AuditLog
-        from agents.llm import LLMResponse
+        from utility.audit import AuditLog
+        from utility.llm import LLMResponse
         log = AuditLog(path)
         log.llm_call(
             messages=[],

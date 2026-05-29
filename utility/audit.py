@@ -15,9 +15,9 @@ Design constraints:
     log never accidentally contains an ndarray.
 
 Usage:
-    from agents.audit import AuditLog
-    from agents.llm import OllamaLLM
-    from agents.tools import Workspace, call_tool
+    from utility.audit import AuditLog
+    from utility.llm import OllamaLLM
+    from utility.tools import Workspace, call_tool
 
     log = AuditLog("logs/session_demo.jsonl",
                    session_metadata={"goal": "analyze hemodynamics"})

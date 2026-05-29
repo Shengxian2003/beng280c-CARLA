@@ -41,12 +41,13 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
 
-from .audit import AuditLog
-from .llm import LLM
+from utility.audit import AuditLog
+from utility.llm import LLM
+from utility.plan_policy import PlanCritique
+from utility.project_context import PROJECT_CONTEXT
+
 from .planner import Plan
-from .project_context import PROJECT_CONTEXT
 
 
 PLAN_CRITIC_SYSTEM = """\
@@ -97,36 +98,6 @@ Reply with ONE JSON object of the form:
 - revise  → concerns MUST list specific, fixable issues
 - reject  → concerns MUST explain why no revision can fix this plan
 """
-
-
-@dataclass
-class PlanCritique:
-    verdict:     str            # "approve" | "revise" | "reject"
-    concerns:    list[str]
-    suggestions: str
-    raw_text:    str            # for the audit log
-
-    @classmethod
-    def from_llm_text(cls, text: str) -> "PlanCritique":
-        payload = json.loads(text)
-        verdict = payload.get("verdict")
-        if verdict not in ("approve", "revise", "reject"):
-            raise ValueError(f"verdict must be approve|revise|reject, got: {verdict!r}")
-        concerns = payload.get("concerns", []) or []
-        if not isinstance(concerns, list):
-            raise ValueError(f"concerns must be a list, got: {type(concerns).__name__}")
-        if verdict in ("revise", "reject") and not concerns:
-            raise ValueError(f"{verdict!r} requires at least one concern")
-        return cls(
-            verdict=verdict,
-            concerns=[str(c) for c in concerns],
-            suggestions=str(payload.get("suggestions", "")),
-            raw_text=text,
-        )
-
-    def is_blocking(self) -> bool:
-        """Returns True if execution should not proceed without action."""
-        return self.verdict in ("revise", "reject")
 
 
 class PlanCritic:

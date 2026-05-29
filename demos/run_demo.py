@@ -43,14 +43,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from agents.audit import AuditLog
+from utility.audit import AuditLog
 from agents.coordinator import Coordinator
-from agents.llm import MockLLM, OllamaLLM
+from utility.llm import MockLLM, OllamaLLM
 from agents.plan_critic import PlanCritic
-from agents.plan_policy import PolicyAction, apply_plan_policy
+from utility.plan_policy import PolicyAction, apply_plan_policy
 from agents.planner import Plan, Planner
 from agents.specialist import build_default_specialists
-from agents.tools import Workspace
+from utility.tools import Workspace
 
 
 DEFAULT_GOAL = (

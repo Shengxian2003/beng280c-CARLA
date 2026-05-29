@@ -20,8 +20,8 @@ from demos.multi_pane import (
     render_final,
     replay,
 )
-from agents.audit import AuditLog
-from agents.llm import LLMResponse
+from utility.audit import AuditLog
+from utility.llm import LLMResponse
 
 
 # ============================================================================

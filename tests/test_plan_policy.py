@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agents.plan_critic import PlanCritique
-from agents.plan_policy import PolicyAction, apply_plan_policy
+from utility.plan_policy import PolicyAction, apply_plan_policy
 
 
 def _critique(verdict, concerns=None, suggestions=""):

@@ -29,7 +29,7 @@ from glob import glob
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.audit import read_log, filter_log
+from utility.audit import read_log, filter_log
 
 
 # Minimum reasoning length to count as an "explanation". Tunable — the value

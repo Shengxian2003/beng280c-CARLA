@@ -19,9 +19,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .audit import AuditLog
-from .llm import LLM
-from .project_context import PROJECT_CONTEXT
+from utility.audit import AuditLog
+from utility.llm import LLM
+from utility.project_context import PROJECT_CONTEXT
 
 
 SUMMARIZER_SYSTEM = """\

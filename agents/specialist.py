@@ -21,10 +21,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .audit import AuditLog
-from .llm import LLM
-from .project_context import PROJECT_CONTEXT
-from .tools import TOOLS_BY_NAME, ToolSpec, Workspace, call_tool
+from utility.audit import AuditLog
+from utility.input_modes import REGISTRY, InputMode, InputProfile, with_no_fresh_recon
+from utility.llm import LLM
+from utility.project_context import PROJECT_CONTEXT
+from utility.tools import TOOLS_BY_NAME, ToolSpec, Workspace, call_tool
 
 
 # ============================================================================
@@ -457,71 +458,42 @@ Be terse. Quote the iteration count, method, and elapsed time in your report.
 """
 
 
-RECON_DEMO_MODE_SUFFIX = """\
-
-## DEMO MODE — important constraint
-You are running in demo mode. Fresh MATLAB reconstruction takes ~12 minutes
-and is not available right now: the `reconstruct` tool is removed from your
-toolset. Always use `load_reconstruction` with the existing 5-iter recon.
-If the verifier later flags quality issues, do not request a re-run — let
-the Hemodynamic Analyzer add appropriate caveats to its report.
-"""
-
-
-RECON_PHANTOM_MODE_SUFFIX = """\
-
-## PHANTOM MODE — important constraint
-You are running on the built-in synthetic curved-tapered phantom (no MATLAB
-reconstruction). Call `load_phantom` exactly once and emit done. The phantom
-ships with its ground-truth mask, so the Segmentation specialist will pass
-through without needing to call any segmentation tools.
-"""
-
-SEG_PHANTOM_MODE_SUFFIX = """\
-
-## ⚠ PASSTHROUGH MODE — STRICT CONSTRAINT ⚠
-A ground-truth mask called 'aorta_phantom' is ALREADY in the workspace,
-placed there by `load_phantom`. You MUST NOT call `suggest_seeds` or
-`segment_from_seed` — those would create a redundant inferior mask and
-waste your energy budget.
-
-Your ONE AND ONLY action this turn:
-  {"done": true, "report": "Passing through pre-loaded mask aorta_phantom.
-   No segmentation needed; downstream specialists will use it by name."}
-"""
-
-
-def build_default_specialists(llm: LLM, *,
-                              demo_mode: bool = False,
-                              phantom_mode: bool = False) -> dict[str, Specialist]:
+def build_default_specialists(
+    llm: LLM,
+    *,
+    input_profile: InputProfile | None = None,
+    demo_mode: bool = False,
+    phantom_mode: bool = False,    # legacy kwarg — kept for backward compat
+) -> dict[str, Specialist]:
     """Construct the four standard specialists, all sharing one LLM backend.
 
     Parameters
     ----------
+    input_profile : InputProfile, optional
+        Preferred way to choose what input the recon specialist is set up
+        for. Drives `recon_tools`, recon prompt suffix, and segmentation
+        passthrough behavior. See ``agents/input_modes.py``.
     demo_mode : bool
         When True, the Reconstruction specialist loses access to the
         ``reconstruct`` tool (MATLAB takes 12 minutes; not suitable for a
-        live demo). It can still call ``load_reconstruction``.
+        live demo). Only applies to REAL_SCAN.
     phantom_mode : bool
-        When True, the Reconstruction specialist gains access to
-        ``load_phantom`` and is told to use it. The Segmentation specialist
-        is told the mask already exists and to skip its tools. Used for the
-        controlled "good case" demo.
+        Legacy kwarg. ``phantom_mode=True`` is equivalent to
+        ``input_profile=REGISTRY[InputMode.PHANTOM]``. Cannot be combined
+        with an explicit ``input_profile``.
     """
-    # Reconstruction tool list
-    if phantom_mode:
-        recon_tools  = ["load_phantom"]
-        recon_prompt = RECONSTRUCTION_PROMPT + RECON_PHANTOM_MODE_SUFFIX
-    elif demo_mode:
-        recon_tools  = ["load_reconstruction"]
-        recon_prompt = RECONSTRUCTION_PROMPT + RECON_DEMO_MODE_SUFFIX
-    else:
-        recon_tools  = ["load_reconstruction", "reconstruct"]
-        recon_prompt = RECONSTRUCTION_PROMPT
+    # ── Resolve which profile to use ──────────────────────────────────────
+    if input_profile is not None and phantom_mode:
+        raise ValueError("pass either input_profile= or phantom_mode=, not both")
+    if input_profile is None:
+        input_profile = REGISTRY[InputMode.PHANTOM] if phantom_mode \
+                        else REGISTRY[InputMode.REAL_SCAN]
+    if demo_mode:
+        input_profile = with_no_fresh_recon(input_profile)
 
-    # Segmentation prompt (tool list unchanged — even in phantom mode it
-    # could fall back to seed-based, but the prompt steers it not to)
-    seg_prompt = SEGMENTATION_PROMPT + (SEG_PHANTOM_MODE_SUFFIX if phantom_mode else "")
+    recon_tools  = list(input_profile.recon_tools)
+    recon_prompt = RECONSTRUCTION_PROMPT + input_profile.recon_prompt_suffix
+    seg_prompt   = SEGMENTATION_PROMPT  + input_profile.seg_prompt_suffix
 
     # Per-specialist round budget — task complexity differs:
     #   Recon/Verifier/Hemo: load → done, ~2 useful rounds + 1 slack

@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .audit import AuditLog
+from utility.audit import AuditLog
 
 
 def _extract_json_object(text: str) -> dict:
@@ -63,8 +63,8 @@ def _extract_json_object(text: str) -> dict:
     raise json.JSONDecodeError(
         "no parseable JSON object in LLM reply", text, 0
     )
-from .llm import LLM
-from .project_context import PROJECT_CONTEXT
+from utility.llm import LLM
+from utility.project_context import PROJECT_CONTEXT
 
 
 PLANNER_SYSTEM = """\

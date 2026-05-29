@@ -4,7 +4,7 @@ Each tool exposes one Stage-2 skill to the LLM as a JSON-schema-described
 function. The LLM never sees raw ndarrays — those live in a per-session
 ``Workspace`` keyed by human-readable names the LLM itself chooses.
 
-    from agents.tools import Workspace, TOOLS, call_tool, tools_prompt_block
+    from utility.tools import Workspace, TOOLS, call_tool, tools_prompt_block
 
     ws = Workspace()
     result = call_tool(ws, "load_reconstruction",

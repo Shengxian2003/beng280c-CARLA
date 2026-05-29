@@ -17,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
 
+from utility.input_modes import REGISTRY as INPUT_PROFILES
 from ui._utils.runner import InputType, RunConfig, kill_orphan_run, run_demo
 from ui._widgets.agent_reports import render_agent_reports
 from ui._widgets.audit_timeline import render_timeline
@@ -58,9 +59,10 @@ st.sidebar.title("🧬 MEDICT")
 st.sidebar.caption("Multi-Agent 4D Flow MRI Pipeline")
 
 st.sidebar.header("Input")
+# Sidebar options are derived from the input-mode registry — adding a new
+# profile in agents/input_modes.py is enough to make it appear here.
 INPUT_LABELS = {
-    InputType.REAL_SCAN: "Real 4D flow scan (.mat reconstruction)",
-    InputType.PHANTOM:   "Synthetic phantom (built-in, for demos)",
+    InputType(p.cli_flag): p.ui_label for p in INPUT_PROFILES.values()
 }
 input_label = st.sidebar.selectbox(
     "What to analyze",

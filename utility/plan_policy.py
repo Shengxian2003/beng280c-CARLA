@@ -44,10 +44,43 @@ of any LLM behavior.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import Enum
 
-from .plan_critic import PlanCritique
+
+@dataclass
+class PlanCritique:
+    """The Plan Critic's verdict on a plan. Produced by `agents.plan_critic`
+    and consumed by `apply_plan_policy` below. Lives here (utility/) rather
+    than next to the agent so the policy gate can reference it without
+    creating a utility → agents dependency."""
+    verdict:     str            # "approve" | "revise" | "reject"
+    concerns:    list[str]
+    suggestions: str
+    raw_text:    str            # for the audit log
+
+    @classmethod
+    def from_llm_text(cls, text: str) -> "PlanCritique":
+        payload = json.loads(text)
+        verdict = payload.get("verdict")
+        if verdict not in ("approve", "revise", "reject"):
+            raise ValueError(f"verdict must be approve|revise|reject, got: {verdict!r}")
+        concerns = payload.get("concerns", []) or []
+        if not isinstance(concerns, list):
+            raise ValueError(f"concerns must be a list, got: {type(concerns).__name__}")
+        if verdict in ("revise", "reject") and not concerns:
+            raise ValueError(f"{verdict!r} requires at least one concern")
+        return cls(
+            verdict=verdict,
+            concerns=[str(c) for c in concerns],
+            suggestions=str(payload.get("suggestions", "")),
+            raw_text=text,
+        )
+
+    def is_blocking(self) -> bool:
+        """Returns True if execution should not proceed without action."""
+        return self.verdict in ("revise", "reject")
 
 
 class PolicyAction(str, Enum):

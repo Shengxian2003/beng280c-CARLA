@@ -43,7 +43,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.align import Align
 
-from agents.audit import read_log
+from utility.audit import read_log
 
 
 # ============================================================================

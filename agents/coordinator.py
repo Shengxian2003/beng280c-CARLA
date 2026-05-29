@@ -15,12 +15,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .audit import AuditLog
-from .llm import LLM
+from utility.audit import AuditLog
+from utility.llm import LLM
 from .planner import Plan
-from .project_context import PROJECT_CONTEXT
+from utility.project_context import PROJECT_CONTEXT
 from .specialist import Specialist
-from .tools import Workspace
+from utility.tools import Workspace
 
 
 COORDINATOR_SYSTEM = """\
@@ -87,7 +87,7 @@ def _coord_decision_summary(text: str) -> str:
 
 @dataclass
 class CoordinatorResult:
-    status: str            # "success" | "max_steps" | "error"
+    status: str            # "success" | "partial" | "error"
     summary: str
     n_delegations: int
     specialists_used: list[str] = field(default_factory=list)
