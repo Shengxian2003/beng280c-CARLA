@@ -261,7 +261,6 @@ def main() -> None:
                         host=args.llm_host or "http://localhost:11434")
 
     # ── Pipeline ────────────────────────────────────────────────
-    workspace = Workspace()
     Path(args.log).parent.mkdir(parents=True, exist_ok=True)
     audit = AuditLog(args.log, session_metadata={
         "goal":         args.goal,
@@ -270,6 +269,19 @@ def main() -> None:
         "architecture": "Planner → PlanCritic → Coordinator → 4 specialists",
         "view":         "good_case",
         "phantom_mode": True,
+    })
+    from utility.session_store import SessionStore
+    project_root = Path(__file__).resolve().parent.parent
+    store = SessionStore(session_id=audit.session_id,
+                         root=project_root / "logs" / "runs")
+    workspace = Workspace(store=store)
+    store.write_input_manifest({
+        "session_id":  audit.session_id,
+        "input_mode":  "phantom",
+        "goal":        args.goal,
+        "llm_backend": args.llm,
+        "llm_model":   getattr(llm, "model", "mock"),
+        "view":        "good_case",
     })
 
     specialists = build_default_specialists(llm, phantom_mode=True)
@@ -312,6 +324,8 @@ def main() -> None:
         llm=llm, specialists=specialists, workspace=workspace, audit=audit,
         max_delegations=8,
         verbose_callback=_make_inline_callback(console, AGENT_COLORS["coordinator"]),
+        # Phantom load is deterministic — no recon re-runs possible.
+        supports_reconstruction_retry=False,
     )
 
     t0 = time.time()

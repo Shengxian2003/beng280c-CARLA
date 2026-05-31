@@ -17,9 +17,55 @@ priorities and language styles.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+
+# ============================================================================
+# Numeric grounding — extracts and compares decimal tokens in text
+# ============================================================================
+
+# Captures signed decimals like "37.35", "-2.6139", "100", "0.001".
+#
+# Scientific notation ("1e-3") is intentionally NOT captured: keeping the
+# regex strict makes it harder for an LLM to slip a hallucinated value past
+# the check by using an unusual format.
+#
+# The negative lookbehind `(?<!\d)` blocks the `-?` from absorbing a range
+# separator dash — without it, a phrase like "SV 60-100 mL" parsed as
+# ["60", "-100"] and the spurious "-100" tripped grounding rejection on
+# legitimate normal-range citations from a specialist's prompt.
+_NUMBER_TOKEN_RE = re.compile(r"(?<!\d)-?\d+(?:\.\d+)?")
+
+
+def _extract_numbers(text: str) -> set[str]:
+    """Return the set of decimal-token strings present in ``text``."""
+    return set(_NUMBER_TOKEN_RE.findall(text or ""))
+
+
+def _gather_grounded_text(history: list[dict]) -> str:
+    """Concatenate every visible message string the LLM has seen this turn.
+
+    Used to build the grounded number set for the done-emission check:
+    every number the specialist cites in its report must appear as a literal
+    decimal token somewhere in this text.
+    """
+    parts: list[str] = []
+    for msg in history:
+        c = msg.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+    return "\n".join(parts)
+
+
+def _num_sort_key(tok: str) -> float:
+    """Sort numeric-string tokens by value for deterministic error output."""
+    try:
+        return float(tok)
+    except ValueError:
+        return float("inf")
 
 from utility.audit import AuditLog
 from utility.input_modes import REGISTRY, InputMode, InputProfile, with_no_fresh_recon
@@ -163,7 +209,9 @@ class Specialist:
     # round regardless of outcome (tool, done, retry). LLM sees remaining
     # budget every round and is warned explicitly on the final round.
     max_rounds:  int = 8
-    max_tokens:  int = 8192           # Qwen 3.6 reasoning eats 500–2000 tokens
+    max_tokens:  int = 16384          # Qwen 3.6 35B thinking can eat 5K–8K
+                                      # tokens before answer; raised from
+                                      # 8192 after observed planner crash.
     project_context: str = PROJECT_CONTEXT
 
     def _tools_block(self) -> str:
@@ -208,6 +256,9 @@ class Specialist:
         """
         purpose       = f"specialist.{self.name}"
         budget        = EnergyBudget(max_rounds=self.max_rounds)
+        # Tag the workspace with this specialist's role so the scoped
+        # read_file / list_dir tools can enforce READ_SCOPES correctly.
+        workspace.current_role = self.name
         # ── Tool-call deduplication ────────────────────────────────
         # Same (tool, args) cannot be invoked twice in one specialist task.
         # Maps (tool_name, args-json-key) → previous result (for the warning).
@@ -275,14 +326,59 @@ class Specialist:
 
             # ── Done ──────────────────────────────────────────────────
             if action.get("done"):
+                # ── Numeric grounding gate ────────────────────────────
+                # Every decimal token in the report must already appear in
+                # the conversation history (system prompt, task, tool
+                # results, files the LLM has read_file'd). Strict literal
+                # match — no rounding tolerance — per the testing-phase
+                # specification: hallucinated metrics must be rejected
+                # even when they round to the right ballpark.
+                report = action.get("report", "")
+                grounded = _extract_numbers(_gather_grounded_text(history))
+                cited = _extract_numbers(report)
+                ungrounded = sorted(cited - grounded, key=_num_sort_key)
+                if ungrounded and budget.rounds_remaining > 1:
+                    budget.spend_round(was_tool=False)
+                    audit.event(f"specialist.{self.name}.grounding_rejection", {
+                        "ungrounded": ungrounded,
+                        "report":     report[:500],
+                    })
+                    history.append({"role": "assistant", "content": resp.text})
+                    history.append({"role": "user", "content": json.dumps({
+                        "error": (
+                            "GROUNDING REJECTED — your report cites numerical "
+                            "values that do NOT appear in any tool result or "
+                            "file you have read this turn. Hallucinating numbers "
+                            "when the tool did not produce them is a CRITICAL "
+                            "audit-trail violation. To recover: either (1) call "
+                            "`read_file` on the relevant JSON output to obtain "
+                            "the real numbers, or (2) re-emit done with the "
+                            "ungrounded numbers removed (use plain language for "
+                            "values you cannot verify)."
+                        ),
+                        "ungrounded_numbers": ungrounded,
+                        "budget":             budget.snapshot(),
+                    })})
+                    step += 1
+                    continue
+                # If the budget is too low to re-prompt, accept done with a
+                # recorded warning rather than thrashing.
                 budget.spend_round(was_tool=False)
                 last_report = {
                     "done":         True,
-                    "report":       action.get("report", ""),
+                    "report":       report,
                     "tools_called": tools_called,
                     "n_steps":      step + 1,
                     "budget":       budget.snapshot(),
                 }
+                if ungrounded:
+                    last_report["grounding_warning"] = {
+                        "ungrounded": ungrounded,
+                        "reason":     "accepted under budget pressure",
+                    }
+                    audit.event(f"specialist.{self.name}.grounding_warn_no_budget", {
+                        "ungrounded": ungrounded,
+                    })
                 break
 
             # ── Tool call ────────────────────────────────────────────
@@ -351,6 +447,47 @@ class Specialist:
 # Standard specialist configurations
 # ============================================================================
 
+_GROUNDING_EPILOGUE = """
+
+## ⚠ MANDATORY: read your own JSON output before emitting done
+
+After your action tool call (verify / analyze / segment_from_seed / load_*),
+the runtime persists the FULL result to a JSON file under the session
+directory. Before emitting your `done` report:
+
+  1. Call `list_dir` to confirm the JSON exists.
+  2. Call `read_file` on that JSON.
+  3. Quote ONLY numbers that appear LITERALLY in the JSON content you just
+     read. Any decimal you write must be character-for-character present in
+     the file. Numbers you cannot find there will be REJECTED by the
+     grounding check at done-emission time.
+
+If your tool calls all returned errors (e.g. "mask not found", "no JSON
+written"), your `done` report MUST say so explicitly and MUST NOT contain
+any numerical metric. Inventing a divergence / flux / SV value when the
+tool produced no result is a CRITICAL audit-trail violation."""
+
+
+_MASK_RESOLUTION_DISCIPLINE = """
+
+## ⚠ MASK-NAME RESOLUTION — FIXED PROCEDURE (DO NOT IMPROVISE)
+
+If the task contains a `[Coordinator handoff] mask_name = "<NAME>"` line,
+USE THAT NAME LITERALLY. Do not invent a different name. Do not strip
+quotes, do not add suffixes, do not turn it into a path.
+
+If the task does NOT name a mask:
+  1. Call `list_dir({"path": "segmentation/masks/"})` first. It returns a
+     list of files like `["aorta_v1.meta.json", "aorta_v1.npy", ...]`.
+  2. The mask names are the basenames without the `.meta.json` / `.npy`
+     extensions. Pick the most recent one (typically the only one).
+  3. Use THAT name in your action tool call.
+
+NEVER pass a guess like `"aorta"`, `"segmentation_v1"`, `"aorta_v95"`, or
+`"segmentation/masks/<anything>"`. Those failure modes have been observed
+repeatedly and the audit log records them as protocol violations."""
+
+
 VERIFIER_PROMPT = """\
 You are the **Physics Verifier** — the deterministic-trust specialist for
 4D flow MRI analyses.
@@ -374,7 +511,10 @@ what to do (re-run reconstruction at more iterations, re-segment with tighter
 percentile, etc.).
 
 Be terse. Quote the numerical values that drove your judgment.
-"""
+
+Your grounded output lives at `verification/verify_<mask_name>.json` after a
+successful `verify()` call. Always read_file it before reporting.
+""" + _MASK_RESOLUTION_DISCIPLINE + _GROUNDING_EPILOGUE
 
 HEMODYNAMIC_PROMPT = """\
 You are the **Hemodynamic Analyzer** — the clinical interpretation specialist
@@ -397,7 +537,10 @@ notable" vs "the metric is unusual because of upstream pipeline quality
 (e.g. merged vessel inflating SV)".
 
 Be terse. Quote the numerical values that drove your judgment.
-"""
+
+Your grounded output lives at `hemodynamic/analyze_<mask_name>.json` after a
+successful `analyze()` call. Always read_file it before reporting.
+""" + _MASK_RESOLUTION_DISCIPLINE + _GROUNDING_EPILOGUE
 
 SEGMENTATION_PROMPT = """\
 You are the **Segmentation Operator** — the vessel-isolation specialist.
@@ -413,11 +556,48 @@ Domain knowledge you bring:
 - Lower percentile (75–85) keeps lumen but can bridge unrelated vessels.
 - Closing_iter=1 is usually enough; > 2 causes excessive merging.
 
+## ⚠ When re-segmenting after a verifier failure
+
+The recovery move depends on WHY verification failed. Read the task
+description (or read_file the relevant verify_<mask>.json) carefully:
+
+### Case A: verifier returned `status: skip` with `branched mask` reason
+The mask is structurally fine but covers a branched vessel (e.g. whole
+thoracic aorta = ascending + arch + descending + supra-aortic branches).
+DO NOT re-segment. Instead, call **`crop_mask`** to isolate one tubular
+segment of the existing mask. Typical recipe for the AS4DF / aortic-arch
+case:
+  - axis = "Z", start_frac = 0.0, end_frac = 0.5   → descending portion
+  - axis = "Z", start_frac = 0.5, end_frac = 1.0   → ascending + arch
+Save the crop under a NEW name (`aorta_v1_desc`, `aorta_v1_asc`, ...).
+The Coordinator will then ask the verifier to re-check the cropped
+single-segment mask.
+
+### Case B: verifier returned `verdict: fail` with high divergence
+This usually means the mask is too small (boundary effects dominate) or
+has reconstruction artefacts inside. Mandatory rule for re-segmentation:
+  1. Call `list_dir("segmentation/masks/")` to discover what masks already
+     exist. Their meta.json files contain the seed coordinates that have
+     already been tried.
+  2. Call `suggest_seeds` (or re-read the cached suggestions from your
+     workspace). Pick a DIFFERENT seed candidate than the one(s) used by
+     the failed mask(s) — `suggested_seeds[1]` or `[2]`, not `[0]` again.
+  3. Give the new mask a NEW name (`aorta_v2`, `aorta_v3`, ...). Do NOT
+     overwrite the old mask name — the Coordinator's verify-fail counter
+     is keyed on mask name and overwriting hides the failure from it.
+
+Tuning percentile/closing on the SAME seed is allowed for the FIRST attempt
+on that seed only. After one fail, rotate seeds.
+
 If a first attempt is clearly bad (empty, tiny, multi-vessel by inspection),
 try a different seed or different percentile before reporting back.
 
 Be terse. Quote the numbers (size, peak speed) for your chosen mask.
-"""
+
+Your grounded output lives at `segmentation/masks/<chosen_name>.meta.json`
+after a successful `segment_from_seed()` call. Always read_file it before
+reporting.
+""" + _GROUNDING_EPILOGUE
 
 RECONSTRUCTION_PROMPT = """\
 You are the **Reconstruction Operator** — the data-prep specialist.
@@ -455,7 +635,10 @@ If the Coordinator says results look noisy or divergence is failing, the right
 call is usually to re-run at 50 iterations.
 
 Be terse. Quote the iteration count, method, and elapsed time in your report.
-"""
+
+Your grounded output lives at `recon/summary.json` after a successful
+load_*/reconstruct() call. Always read_file it before reporting.
+""" + _GROUNDING_EPILOGUE
 
 
 def build_default_specialists(
@@ -495,36 +678,67 @@ def build_default_specialists(
     recon_prompt = RECONSTRUCTION_PROMPT + input_profile.recon_prompt_suffix
     seg_prompt   = SEGMENTATION_PROMPT  + input_profile.seg_prompt_suffix
 
+    # Segmentation specialist: under passthrough mode (phantom / AS4DF with
+    # pre-loaded ground-truth mask) we ALSO strip its tool allowlist and cap
+    # rounds to 1. Symmetric to the recon-tool isolation above: relying on
+    # the prompt suffix alone has empirically not been enough for small LLMs,
+    # which still attempt suggest_seeds / segment_from_seed and pollute the
+    # workspace with `aorta_v6 / aorta_stl_segmented` etc.
+    if input_profile.seg_passthrough:
+        seg_tool_names = []
+        seg_max_rounds = 1
+    else:
+        # crop_mask gives the segmentation specialist a recovery move when
+        # the verifier returns SKIP on a branched mask: instead of
+        # producing yet another full-aorta mask under a new name, the
+        # specialist can crop an existing mask down to one tubular segment.
+        seg_tool_names = ["suggest_seeds", "segment_from_seed", "crop_mask"]
+        seg_max_rounds = 8
+
+    # All specialists get read_file + list_dir so they can read their own
+    # tool outputs (verdicts, mask metadata, recon summary, ...) before
+    # composing a report. Access is scoped per role at the tool layer via
+    # READ_SCOPES — extra tool names here don't grant extra paths.
+    READ_TOOLS = ["read_file", "list_dir"]
+
     # Per-specialist round budget — task complexity differs:
     #   Recon/Verifier/Hemo: load → done, ~2 useful rounds + 1 slack
     #   Segmentation:        may legitimately try multiple seeds + parameters
+    # We bump the round caps by 1 to leave headroom for the mandatory
+    # read-back of the role's own JSON output before emitting done.
     return {
         "reconstruction": Specialist(
             name="reconstruction",
             system_prompt=recon_prompt,
-            tool_names=recon_tools,
+            tool_names=recon_tools + READ_TOOLS,
             llm=llm,
-            max_rounds=3,
+            max_rounds=4,
         ),
         "segmentation": Specialist(
             name="segmentation",
             system_prompt=seg_prompt,
-            tool_names=["suggest_seeds", "segment_from_seed"],
+            tool_names=seg_tool_names + READ_TOOLS,
             llm=llm,
-            max_rounds=8,
+            # Passthrough mode keeps its 1-round cap (LLM must just emit done);
+            # active mode gets +1 for read_file before report.
+            max_rounds=seg_max_rounds if input_profile.seg_passthrough else seg_max_rounds + 1,
         ),
         "verifier": Specialist(
             name="verifier",
             system_prompt=VERIFIER_PROMPT,
-            tool_names=["verify"],
+            tool_names=["verify"] + READ_TOOLS,
             llm=llm,
-            max_rounds=3,
+            # 5 rounds = 1 list_dir (discovery) + 1 verify + 1 read_file
+            # (grounded re-read) + 1 done + 1 slack for retry after a
+            # mis-named verify error. Tuned to the observed Verifier
+            # failure-recovery path.
+            max_rounds=5,
         ),
         "hemodynamic": Specialist(
             name="hemodynamic",
             system_prompt=HEMODYNAMIC_PROMPT,
-            tool_names=["analyze"],
+            tool_names=["analyze"] + READ_TOOLS,
             llm=llm,
-            max_rounds=3,
+            max_rounds=5,
         ),
     }

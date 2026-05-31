@@ -40,7 +40,8 @@ def test_each_check_has_status():
     tx, ty, tz = _phase_field(0.8)
     result = verify(tx, ty, tz, VENC)
     for name, check in result["checks"].items():
-        assert check["status"] in ("pass", "warn", "fail"), f"{name} missing valid status"
+        assert check["status"] in ("pass", "warn", "fail", "skip"), \
+            f"{name} missing valid status"
 
 
 def test_metadata_fields():

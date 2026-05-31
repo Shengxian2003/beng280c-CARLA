@@ -27,12 +27,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Config + result types
 # ─────────────────────────────────────────────────────────────────────
 
-# InputType mirrors agents.input_modes.InputMode for UI-side typing. The
+# InputType mirrors utility.input_modes.InputMode for UI-side typing. The
 # string values MUST match `profile.cli_flag` for each mode in the registry
 # (the runner passes `cfg.input_type.value` directly via --input-mode).
 class InputType(str, Enum):
     REAL_SCAN = "real_scan"
     PHANTOM   = "phantom"
+    AS4DF     = "as4df"
+
+
+@dataclass
+class AS4DFOptions:
+    """Free-form options for AS4DF runs; consumed by the AS4DF profile's
+    goal_template. `dataset_root` is absolutified by the runner before being
+    passed into the goal so the LLM never sees a relative path it might mangle."""
+    dataset_root:   str  = ""
+    model:          str  = "m_c1"
+    n_frames:       int  = 50
+    load_stl_mask:  bool = True
 
 
 @dataclass
@@ -46,6 +58,7 @@ class RunConfig:
     max_plan_revisions: int   = 0
     max_delegations:    int   = 12
     custom_goal:        Optional[str] = None
+    as4df_opts:         Optional[AS4DFOptions] = None
 
 
 @dataclass
@@ -69,15 +82,35 @@ class RunResult:
 # subprocess argv.
 # ─────────────────────────────────────────────────────────────────────
 
-def build_goal(cfg: RunConfig) -> str:
-    """Build the user-facing goal for `cfg` using the registered profile."""
-    profile = get_profile(cfg.input_type.value)
-    return profile.goal_template({
+def _profile_opts(cfg: RunConfig) -> dict:
+    """Bundle runtime options into the dict shape the profile's goal_template
+    expects. Per-mode keys live alongside common ones; profiles only read
+    what they care about."""
+    opts = {
         "custom_goal":   cfg.custom_goal,
         "scan_path":     cfg.scan_path,
         "venc_m_per_s":  cfg.venc_m_per_s,
         "voxel_size_mm": cfg.voxel_size_mm,
-    })
+    }
+    if cfg.as4df_opts:
+        # Resolve to ABSOLUTE path here so the LLM only ever sees a fully-
+        # qualified string and can't prepend a stray prefix.
+        abs_root = Path(cfg.as4df_opts.dataset_root)
+        if not abs_root.is_absolute():
+            abs_root = (PROJECT_ROOT / abs_root).resolve()
+        opts.update({
+            "dataset_root":  str(abs_root),
+            "model":         cfg.as4df_opts.model,
+            "n_frames":      cfg.as4df_opts.n_frames,
+            "load_stl_mask": cfg.as4df_opts.load_stl_mask,
+        })
+    return opts
+
+
+def build_goal(cfg: RunConfig) -> str:
+    """Build the user-facing goal for `cfg` using the registered profile."""
+    profile = get_profile(cfg.input_type.value)
+    return profile.goal_template(_profile_opts(cfg))
 
 
 def _build_command(cfg: RunConfig) -> tuple[list[str], Path]:
@@ -91,10 +124,15 @@ def _build_command(cfg: RunConfig) -> tuple[list[str], Path]:
 
     if cfg.input_type == InputType.REAL_SCAN and not cfg.scan_path:
         raise ValueError("REAL_SCAN requires scan_path")
+    if cfg.input_type == InputType.AS4DF and not (cfg.as4df_opts and cfg.as4df_opts.dataset_root):
+        raise ValueError("AS4DF requires dataset_root in as4df_opts")
 
     # Per-mode log path so simultaneous runs / replays don't collide
     if cfg.input_type == InputType.REAL_SCAN:
         log_path = PROJECT_ROOT / "logs" / f"ui_real_{Path(cfg.scan_path).stem}.jsonl"
+    elif cfg.input_type == InputType.AS4DF:
+        opts = cfg.as4df_opts
+        log_path = PROJECT_ROOT / "logs" / f"ui_as4df_{opts.model}_{opts.n_frames}F.jsonl"
     else:
         log_path = PROJECT_ROOT / "logs" / f"ui_{cfg.input_type.value}.jsonl"
 
@@ -111,6 +149,14 @@ def _build_command(cfg: RunConfig) -> tuple[list[str], Path]:
     # Real-scan loads existing .mat (don't trigger MATLAB) — preserved behavior
     if cfg.input_type == InputType.REAL_SCAN:
         argv.append("--no-fresh-recon")
+
+    # AS4DF without the STL ground-truth mask: re-enable the segmentation
+    # specialist so it can produce a PC-MRA mask. Otherwise the profile would
+    # leave seg gagged and the run dead-ends after recon.
+    if (cfg.input_type == InputType.AS4DF
+            and cfg.as4df_opts
+            and not cfg.as4df_opts.load_stl_mask):
+        argv.append("--no-seg-passthrough")
 
     return argv, log_path
 
@@ -264,6 +310,7 @@ def _parse_audit_log(path: Path) -> dict:
 def run_demo(cfg: RunConfig, *,
              pipeline_placeholder=None,
              stdout_placeholder=None) -> RunResult:
+    import os
     argv, log_path = _build_command(cfg)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Clear stale log so live tail starts fresh
@@ -282,8 +329,23 @@ def run_demo(cfg: RunConfig, *,
     if pipeline_placeholder is not None:
         render_pipeline(state, pipeline_placeholder)
 
+    # Anti-hallucination anchor: pass dataset path / model / n_frames / STL
+    # toggle via env vars so the load_as4df tool reads them directly. Small
+    # LLMs (qwen2.5:7b) tend to fabricate paths (/mnt/g/medict_tmp/...) even
+    # when goal text says "use AS-IS". Env vars win over LLM args.
+    env = os.environ.copy()
+    if cfg.input_type == InputType.AS4DF and cfg.as4df_opts:
+        opts = cfg.as4df_opts
+        abs_root = Path(opts.dataset_root)
+        if not abs_root.is_absolute():
+            abs_root = (PROJECT_ROOT / abs_root).resolve()
+        env["MEDICT_AS4DF_ROOT"]     = str(abs_root)
+        env["MEDICT_AS4DF_MODEL"]    = opts.model
+        env["MEDICT_AS4DF_N_FRAMES"] = str(opts.n_frames)
+        env["MEDICT_AS4DF_LOAD_STL"] = "true" if opts.load_stl_mask else "false"
+
     proc = subprocess.Popen(
-        argv, cwd=str(PROJECT_ROOT),
+        argv, cwd=str(PROJECT_ROOT), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
     )

@@ -18,7 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import streamlit as st
 
 from utility.input_modes import REGISTRY as INPUT_PROFILES
-from ui._utils.runner import InputType, RunConfig, kill_orphan_run, run_demo
+from ui._utils.runner import AS4DFOptions, InputType, RunConfig, kill_orphan_run, run_demo
 from ui._widgets.agent_reports import render_agent_reports
 from ui._widgets.audit_timeline import render_timeline
 from ui._widgets.hemodynamic_panel import render_hemodynamic
@@ -75,6 +75,40 @@ input_type = input_label
 scan_path: str | None = None
 venc        = 1.5
 voxel_mm    = 2.0
+as4df_opts: AS4DFOptions | None = None
+
+if input_type == InputType.AS4DF:
+    as4df_root = st.sidebar.text_input(
+        "AS4DF dataset root",
+        value="data/Stanford_AS4DF",
+        help="Folder containing 'dicoms/' and 'stl/' subdirectories. "
+             "Relative paths are resolved against the project root.",
+    )
+    as4df_model = st.sidebar.selectbox(
+        "AS4DF model",
+        options=["m_c1", "m_c2", "m_r"],
+        index=0,
+        help="m_c1 / m_c2 = compliant wall variants; m_r = rigid wall.",
+    )
+    as4df_frames = st.sidebar.selectbox(
+        "AS4DF temporal resolution",
+        options=[16, 25, 50],
+        index=2,
+        format_func=lambda n: f"{n} frames per cycle",
+    )
+    as4df_use_stl = st.sidebar.checkbox(
+        "Use STL ground-truth mask (skip segmentation)",
+        value=True,
+        help="When checked: load the STL mesh as the vessel mask. When "
+             "unchecked: let the Segmentation specialist try to produce "
+             "a mask from PC-MRA, so you can compare against ground truth.",
+    )
+    as4df_opts = AS4DFOptions(
+        dataset_root  = as4df_root,
+        model         = as4df_model,
+        n_frames      = as4df_frames,
+        load_stl_mask = as4df_use_stl,
+    )
 
 if input_type == InputType.REAL_SCAN:
     # Quick presets that resolve to known paths on this system.
@@ -138,7 +172,9 @@ with st.sidebar.expander("Advanced options"):
 
 st.sidebar.divider()
 run_disabled = (
-    input_type == InputType.REAL_SCAN and not (scan_path or "").strip()
+    (input_type == InputType.REAL_SCAN and not (scan_path or "").strip())
+    or (input_type == InputType.AS4DF
+        and not (as4df_opts and as4df_opts.dataset_root.strip()))
 )
 run_button = st.sidebar.button(
     "▶ Analyze",
@@ -223,6 +259,7 @@ if run_button:
         llm_model          = llm_model,
         max_plan_revisions = max_plan_revisions,
         max_delegations    = max_delegations,
+        as4df_opts         = as4df_opts,
     )
     with main_col:
         st.subheader("Pipeline output")

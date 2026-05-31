@@ -51,6 +51,38 @@ A typical workflow:
 You can re-delegate to the same specialist if its previous attempt failed
 or the result was insufficient. You can also finish early if verification
 fails repeatedly and you want to report partial results.
+
+## ⚠ Error classification — distinguish addressing errors from quality verdicts
+
+When a specialist reports back, the cause of "verification failed" matters:
+
+  (a) **Addressing error** — the specialist's tool returned
+      `"error": "mask 'X' not found — known masks: [...]"`.
+      The data is fine; the LOOKUP was wrong. The specialist named a mask
+      that does not exist in the workspace.
+      → CORRECT RESPONSE: re-delegate to the SAME specialist with the
+        correct `mask_name` (read it from the known-masks list or from the
+        most recent segmentation report). Do NOT re-delegate upstream;
+        re-segmentation will not help, it will simply produce the same
+        mask under the same name.
+
+  (b) **Data-quality verdict** — the verifier's `verify()` returned a real
+      verdict dict with `"verdict": "fail"` and numeric reasons (high
+      divergence, large flux deviation, etc.).
+      → CORRECT RESPONSE: re-delegate upstream (segmentation with tighter
+        parameters, or reconstruction with more iterations) and re-verify.
+
+  (c) **Empty mask / skip** — `verify()` returned `"verdict": "skip"` because
+      the named mask has zero voxels.
+      → CORRECT RESPONSE: re-delegate to segmentation to produce a real mask,
+        OR if STL was supposed to be loaded, surface the upstream loader
+        failure honestly.
+
+Treating (a) as (b) — re-running segmentation in response to a naming bug —
+wastes the delegation budget and never converges, since every retry
+produces the same mask under the same name. This was the dominant failure
+mode in past sessions. Read the specialist's tools_called and the latest
+verify tool_call error TYPE before deciding.
 """
 
 COORDINATOR_PROTOCOL = """\
@@ -61,7 +93,16 @@ At every turn, reply with ONE JSON object. Two shapes are valid:
   To delegate to a specialist:
     {"delegate_to": "<specialist name>",
      "task":        "<natural-language instruction to that specialist>",
+     "mask_name":   "<the exact mask identifier the specialist must act on>",
      "why":         "<one-sentence rationale for picking this specialist>"}
+
+  The `mask_name` field is REQUIRED when delegating to `verifier` or
+  `hemodynamic` if at least one mask exists in the workspace. It MUST be
+  one of the existing mask identifiers (e.g. `aorta_v1`) — never a path,
+  never a description ("the segmented mask"), never the name of a verdict
+  category. When delegating to `reconstruction` or `segmentation`, the
+  field is optional. The dispatcher rejects verifier/hemodynamic
+  delegations that omit it when masks are available.
 
   To finish the session:
     {"done":    true,
@@ -106,9 +147,14 @@ class Coordinator:
         *,
         max_delegations: int = 6,                   # was 12 — lowered to fail
                                                     # faster on hard datasets
-        max_tokens: int = 8192,                     # was 2048 — match planner/critic
+        max_tokens: int = 16384,                    # raised so reasoning models
+                                                    # (qwen3.x with thinking)
+                                                    # have room for thinking
+                                                    # + JSON delegation reply.
         verbose_callback: Optional[Callable[[str], None]] = None,
         project_context: str = PROJECT_CONTEXT,
+        supports_reconstruction_retry: bool = True,
+        max_verify_failures_per_mask: int = 2,
     ):
         self.llm = llm
         self.specialists = specialists
@@ -118,6 +164,14 @@ class Coordinator:
         self.max_tokens = max_tokens
         self.verbose = verbose_callback
         self.project_context = project_context
+        # Locks out reconstruction re-delegation for input modes whose load
+        # is one-shot (phantom, AS4DF, real_scan in load-only mode). Set
+        # from the active InputProfile by the demo entry point.
+        self.supports_reconstruction_retry = supports_reconstruction_retry
+        # Force-done after the same mask has been verified-failed this many
+        # times. Stops the "seg → verify fail → seg → verify fail" loop
+        # from consuming the entire delegation budget without converging.
+        self.max_verify_failures_per_mask = max_verify_failures_per_mask
 
     def _initial_messages(
         self, user_goal: str, plan: Plan | None = None, warning: str | None = None,
@@ -130,6 +184,34 @@ class Coordinator:
             COORDINATOR_PROTOCOL,
             f"\n\n## Specialists actually available this session\n{roster}\n",
         ]
+        if not self.supports_reconstruction_retry:
+            system_parts.append(
+                "\n\n## Reconstruction is ONE-SHOT for this input mode\n"
+                "The current input mode loads its data directly (synthetic\n"
+                "phantom, AS4DF DICOM, or a pre-saved .mat reconstruction).\n"
+                "There is NO parameter to tune by re-running it. Re-delegating\n"
+                "to the reconstruction specialist after the initial load CANNOT\n"
+                "produce different data — it will either re-load the same bytes\n"
+                "or no-op.\n\n"
+                "Therefore: after the FIRST successful reconstruction\n"
+                "delegation, you MUST NOT delegate to reconstruction again.\n"
+                "If verification fails, your only useful recovery moves are:\n"
+                "  (a) re-delegate to segmentation with a DIFFERENT seed or\n"
+                "      tighter parameters (not the same seed with new params),\n"
+                "  (b) emit done=true with an honest caveat that the data\n"
+                "      cannot be analyzed with the available tools.\n"
+                "The dispatcher will reject a second reconstruction delegation\n"
+                "and record the attempt as a protocol violation."
+            )
+        system_parts.append(
+            "\n\n## Verify-fail loop cap (avoid burning the budget)\n"
+            f"If the SAME `mask_name` returns `verdict: fail` from `verify` "
+            f"{self.max_verify_failures_per_mask} times within this session, "
+            f"you MUST emit done=true with a partial-results summary on the "
+            f"next turn. Re-segmenting the same vessel another time will "
+            f"almost certainly produce another failing mask; honest escalation "
+            f"is correct."
+        )
         if plan is not None:
             system_parts.append("\n\n" + plan.to_prompt_block())
         if warning:
@@ -155,6 +237,10 @@ class Coordinator:
         history = self._initial_messages(user_goal, plan=plan, warning=warning)
         used: list[str] = []
         last: dict | None = None
+        # Track recon delegations + per-mask verify-fail counts for the
+        # one-shot recon lock-out (Fix 5) and the verify-fail loop cap (Fix 7).
+        recon_delegations_completed = 0
+        verify_fail_count: dict[str, int] = {}
 
         # Pipeline progress tracker — visible to the LLM in every energy block
         STAGES = ["reconstruction", "segmentation", "verifier", "hemodynamic"]
@@ -282,6 +368,7 @@ class Coordinator:
             # Delegation
             spec_name = decision.get("delegate_to")
             task = decision.get("task", "")
+            mask_name = decision.get("mask_name")
             specialist = self.specialists.get(spec_name)
             if specialist is None:
                 err = (f"specialist {spec_name!r} not in roster "
@@ -291,12 +378,134 @@ class Coordinator:
                 self.audit.event("bad_delegation", {"requested": spec_name})
                 continue
 
-            self.audit.event("delegation", {"to": spec_name, "task": task[:200]})
-            report = specialist.handle(task,
+            # ── Mask-name handoff enforcement (Fix 1) ────────────────────
+            # Verifier and Hemodynamic operate on a specific named mask. If
+            # any masks exist in the workspace, the Coordinator must name
+            # the one to act on so the downstream specialist does not have
+            # to guess.
+            requires_mask = spec_name in ("verifier", "hemodynamic")
+            known_masks   = sorted(self.workspace.masks)
+            if requires_mask and known_masks and not mask_name:
+                err = (
+                    f"delegations to {spec_name!r} REQUIRE a `mask_name` field "
+                    f"when masks exist in the workspace. Known masks: "
+                    f"{known_masks}. Re-emit your delegation with "
+                    f"`mask_name` set to one of those identifiers."
+                )
+                history.append({"role": "assistant", "content": resp.text})
+                history.append({"role": "user", "content": json.dumps({
+                    "error":       err,
+                    "known_masks": known_masks,
+                })})
+                self.audit.event("missing_mask_name_in_delegation", {
+                    "to":          spec_name,
+                    "known_masks": known_masks,
+                })
+                continue
+            if mask_name and known_masks and mask_name not in known_masks:
+                err = (
+                    f"`mask_name`={mask_name!r} is not a known mask in the "
+                    f"workspace. Known masks: {known_masks}. Either name an "
+                    f"existing mask or first delegate to segmentation to "
+                    f"produce a new one."
+                )
+                history.append({"role": "assistant", "content": resp.text})
+                history.append({"role": "user", "content": json.dumps({
+                    "error":       err,
+                    "known_masks": known_masks,
+                })})
+                self.audit.event("unknown_mask_name_in_delegation", {
+                    "to":          spec_name,
+                    "mask_name":   mask_name,
+                    "known_masks": known_masks,
+                })
+                continue
+
+            # ── Reconstruction one-shot lock-out (Fix 5) ────────────────
+            # When the active input mode's data load is one-shot (phantom,
+            # AS4DF, real-scan no-fresh-recon), a second reconstruction
+            # delegation cannot help — reject it without consuming the
+            # specialist's energy budget. The Coordinator gets the rejection
+            # message back and is forced to pick a different action.
+            if (spec_name == "reconstruction"
+                    and not self.supports_reconstruction_retry
+                    and recon_delegations_completed >= 1):
+                err = (
+                    "Reconstruction is one-shot for this input mode (no "
+                    "iteration parameter to tune). Further reconstruction "
+                    "delegations CANNOT change the data. Pick a different "
+                    "specialist or emit done=true with caveats."
+                )
+                history.append({"role": "assistant", "content": resp.text})
+                history.append({"role": "user", "content": json.dumps({
+                    "error": err,
+                    "supports_reconstruction_retry": False,
+                })})
+                self.audit.event("recon_retry_blocked", {
+                    "input_mode_is_one_shot": True,
+                })
+                continue
+
+            # ── Verify-fail loop cap (Fix 7) ────────────────────────────
+            # If the Coordinator wants to re-verify a mask that has already
+            # failed N times this session, block it. Re-verifying the same
+            # mask cannot change the verdict; the Coordinator must either
+            # produce a NEW mask first or escalate to done.
+            if (spec_name == "verifier"
+                    and mask_name
+                    and verify_fail_count.get(mask_name, 0)
+                        >= self.max_verify_failures_per_mask):
+                err = (
+                    f"Mask {mask_name!r} has already failed verification "
+                    f"{verify_fail_count[mask_name]} times this session. "
+                    f"Re-verifying it CANNOT change the verdict. Either "
+                    f"delegate to segmentation to produce a new mask under "
+                    f"a different name, or emit done=true with an honest "
+                    f"summary of the failed verifications."
+                )
+                history.append({"role": "assistant", "content": resp.text})
+                history.append({"role": "user", "content": json.dumps({
+                    "error":              err,
+                    "verify_fail_count":  verify_fail_count,
+                })})
+                self.audit.event("verify_fail_cap_blocked", {
+                    "mask_name": mask_name,
+                    "count":     verify_fail_count[mask_name],
+                })
+                continue
+
+            # Embed the resolved mask_name into the specialist's task so it
+            # is the very first thing the specialist's LLM reads. This is the
+            # architectural answer to past sessions where the Verifier
+            # specialist invented a mask name because the task prose did not
+            # include one.
+            specialist_task = task
+            if mask_name:
+                specialist_task = (
+                    f"[Coordinator handoff] mask_name = \"{mask_name}\"\n\n"
+                    + task
+                )
+
+            self.audit.event("delegation", {
+                "to":        spec_name,
+                "task":      task[:200],
+                "mask_name": mask_name,
+            })
+            report = specialist.handle(specialist_task,
                                        workspace=self.workspace,
                                        audit=self.audit,
                                        verbose_callback=self.verbose)
             used.append(spec_name)
+            if spec_name == "reconstruction":
+                recon_delegations_completed += 1
+            # Inspect the verifier's verdict via the workspace (the ground-
+            # truth state) to count fails toward the loop cap. We use the
+            # workspace not the specialist's report, because the report is
+            # LLM-prose subject to grounding violations.
+            if spec_name == "verifier" and mask_name in self.workspace.verdicts:
+                vd = self.workspace.verdicts[mask_name].get("verdict")
+                if vd == "fail":
+                    verify_fail_count[mask_name] = verify_fail_count.get(mask_name, 0) + 1
 
             # Feed report back into the conversation
             history.append({"role": "assistant", "content": resp.text})

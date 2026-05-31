@@ -19,7 +19,8 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -30,6 +31,8 @@ from skills.segmentation import (
 )
 from skills.physics_verifier import verify as _verify
 from skills.hemodynamic import analyze as _analyze
+
+from .session_store import SessionStore, is_path_allowed
 
 
 # ============================================================================
@@ -57,6 +60,16 @@ class Workspace:
     venc_m_per_s: float = 1.5
     voxel_size_mm: tuple[float, float, float] = (2.0, 2.0, 2.0)
     dt_seconds: float = 0.05
+
+    # On-disk artifact store (set by the orchestrator at session start).
+    # Tools call store.write_* in addition to mutating the workspace so the
+    # session directory always has a grounded, LLM-readable snapshot.
+    store: Optional[SessionStore] = None
+
+    # The specialist role currently driving tool calls. Set by Specialist
+    # at the start of each handle() so the scoped read_file tool can check
+    # the caller's permissions against READ_SCOPES.
+    current_role: str = ""
 
     def require_recon(self) -> dict:
         if self.recon is None:
@@ -202,13 +215,26 @@ def _tool_load_reconstruction(ws: Workspace, mat_path: str,
     ws.venc_m_per_s = venc_m_per_s
     ws.voxel_size_mm = (voxel_size_mm_dz, voxel_size_mm_dy, voxel_size_mm_dx)
     ws.suggested_seeds = None  # invalidate cache
-    return {
+    info = {
         "status": "loaded",
+        "source": "real_scan",
         "source_path": mat_path,
         "shape_ZYXT": list(ws.recon["xHat"].shape),
         "venc_m_per_s": venc_m_per_s,
         "voxel_size_mm": list(ws.voxel_size_mm),
     }
+    _persist_recon(ws, info)
+    return info
+
+
+def _persist_recon(ws: "Workspace", summary: dict) -> None:
+    """Dual-write: dump recon summary JSON + raw arrays to the session store."""
+    if ws.store is None or ws.recon is None:
+        return
+    arrays = {k: np.asarray(ws.recon[k])
+              for k in ("xHat", "thetaX", "thetaY", "thetaZ")
+              if k in ws.recon}
+    ws.store.write_recon(summary=summary, arrays=arrays)
 
 
 # ----- reconstruct (slow — wraps Stage 2a) ---------------------------------
@@ -282,8 +308,9 @@ def _tool_reconstruct(ws: Workspace, kspace_path: str,
     ws.venc_m_per_s = venc_m_per_s
     ws.voxel_size_mm = (voxel_size_mm_dz, voxel_size_mm_dy, voxel_size_mm_dx)
     ws.suggested_seeds = None
-    return {
+    info = {
         "status": "ok",
+        "source": "fresh_recon",
         "method": method,
         "n_iterations": n_iterations,
         "shape_ZYXT": list(result["xHat"].shape),
@@ -291,11 +318,100 @@ def _tool_reconstruct(ws: Workspace, kspace_path: str,
         "preview_paths": result.get("preview_paths", []),
         "elapsed_wall_s": round(time.time() - t0, 1),
         "matlab_elapsed_minutes": result.get("meta", {}).get("elapsed_minutes"),
+        "venc_m_per_s": venc_m_per_s,
+        "voxel_size_mm": list(ws.voxel_size_mm),
     }
+    _persist_recon(ws, info)
+    return info
 
 
 # How often to refresh the elapsed-time status line during a MATLAB recon.
 _RECON_PROGRESS_INTERVAL_S = 3.0
+
+
+# ----- load_as4df (Stanford physical phantom + STL ground truth) ----------
+
+def _tool_load_as4df(ws: Workspace,
+                     dataset_root: str | None = None,
+                     model: str = "m_c1",
+                     n_frames: int = 50,
+                     load_stl_mask: bool = True,
+                     mask_name: str = "aorta_stl") -> dict:
+    """
+    Load a Stanford AS4DF (Aortic Stiffness 4D Flow) acquisition into the
+    workspace. AS4DF is a 3D-printed compliant aorta phantom imaged with
+    standard 4D flow MRI sequences, with STL meshes giving the ground-truth
+    vessel geometry — this lets us evaluate segmentation against truth.
+
+    Host overrides:
+        When the runner has set env vars MEDICT_AS4DF_ROOT / MEDICT_AS4DF_MODEL
+        / MEDICT_AS4DF_N_FRAMES / MEDICT_AS4DF_LOAD_STL, those win over
+        whatever the LLM passed as arguments. This is the anti-hallucination
+        anchor for small LLMs that tend to fabricate paths (e.g.
+        /mnt/g/medict_tmp/...) even when the goal text says otherwise.
+    """
+    import os
+    env_root  = os.environ.get("MEDICT_AS4DF_ROOT")
+    env_model = os.environ.get("MEDICT_AS4DF_MODEL")
+    env_n     = os.environ.get("MEDICT_AS4DF_N_FRAMES")
+    env_stl   = os.environ.get("MEDICT_AS4DF_LOAD_STL")
+    if env_root:  dataset_root  = env_root
+    if env_model: model         = env_model
+    if env_n:     n_frames      = int(env_n)
+    if env_stl is not None:
+        load_stl_mask = env_stl.strip().lower() in ("1", "true", "yes", "on")
+    if not dataset_root:
+        return {"error": "dataset_root not supplied and no MEDICT_AS4DF_ROOT env var",
+                "tool":  "load_as4df"}
+
+    from skills.dicom_loader import load_as4df, voxelize_stl_to_mask
+
+    recon = load_as4df(dataset_root, model=model,
+                       n_frames=n_frames, use_corrected=True)
+    ws.recon            = {k: recon[k] for k in ("xHat", "thetaX", "thetaY", "thetaZ")}
+    ws.venc_m_per_s     = recon["venc_m_per_s"]
+    ws.voxel_size_mm    = recon["voxel_size_mm"]
+    ws.dt_seconds       = recon["dt_seconds"]
+    ws.suggested_seeds  = None
+
+    info: dict = {
+        "status":        "loaded",
+        "source":        "AS4DF",
+        "dataset_root":  str(dataset_root),    # ★ recorded for downstream UI panels
+        "model":         model,
+        "n_frames":      n_frames,
+        "load_stl_mask": load_stl_mask,
+        "shape_ZYXT":    list(recon["thetaX"].shape),
+        "venc_m_per_s":  recon["venc_m_per_s"],
+        "voxel_size_mm": list(recon["voxel_size_mm"]),
+    }
+
+    if load_stl_mask:
+        stl_path = Path(dataset_root) / "stl"
+        candidates = sorted(stl_path.glob("*.stl"),
+                            key=lambda p: p.stat().st_size, reverse=True)
+        if candidates:
+            mask = voxelize_stl_to_mask(
+                candidates[0],
+                shape_ZYX=recon["thetaX"].shape[:3],
+                voxel_size_mm=recon["voxel_size_mm"],
+                origin_mm=recon.get("origin_mm"),       # DICOM-grid alignment
+            )
+            ws.masks[mask_name] = mask
+            info["mask_name"]     = mask_name
+            info["mask_voxels"]   = int(mask.sum())
+            info["stl_used"]      = candidates[0].name
+            if ws.store is not None:
+                ws.store.write_mask(mask_name, mask=mask, meta={
+                    "source":    "AS4DF STL voxelization",
+                    "stl_file":  candidates[0].name,
+                    "n_voxels":  int(mask.sum()),
+                })
+        else:
+            info["mask_warning"]  = "no STL files found under <root>/stl/"
+
+    _persist_recon(ws, info)
+    return info
 
 
 # ----- load_phantom (good-case demo) --------------------------------------
@@ -331,8 +447,9 @@ def _tool_load_phantom(ws: Workspace,
     ws.dt_seconds      = p["dt_seconds"]
     ws.suggested_seeds = None
     ws.masks[mask_name] = p["mask"]
-    return {
+    info = {
         "status":         "phantom_loaded",
+        "source":         "synthetic_phantom",
         "mask_name":      mask_name,
         "shape_ZYXT":     list(p["thetaX"].shape),
         "venc_m_per_s":   p["venc_m_per_s"],
@@ -341,6 +458,14 @@ def _tool_load_phantom(ws: Workspace,
         "geometry":       p.get("geometry", "tapered_incompressible"),
         "note":           "ground-truth mask already in workspace; no segmentation needed",
     }
+    _persist_recon(ws, info)
+    if ws.store is not None:
+        ws.store.write_mask(mask_name, mask=p["mask"], meta={
+            "source":   "synthetic phantom analytic mask",
+            "geometry": p.get("geometry", "tapered_incompressible"),
+            "n_voxels": int(p["mask"].sum()),
+        })
+    return info
 
 
 # ----- suggest_seeds -------------------------------------------------------
@@ -368,6 +493,8 @@ def _tool_suggest_seeds(ws: Workspace, n_candidates: int = 5,
             "bbox_dims":   [int(z1 - z0), int(y1 - y0), int(x1 - x0)],
         })
     ws.suggested_seeds = candidates
+    if ws.store is not None:
+        ws.store.write_seed_suggestions(summary)
     return {"candidates": summary, "n_returned": len(summary)}
 
 
@@ -402,7 +529,7 @@ def _tool_segment_from_seed(ws: Workspace, seed_z: int, seed_y: int, seed_x: int
     )
     peak = float(speed[mask].max())
 
-    return {
+    info = {
         "status":            "ok",
         "mask_name":         mask_name,
         "seed_zyx":          [seed_z, seed_y, seed_x],
@@ -411,6 +538,16 @@ def _tool_segment_from_seed(ws: Workspace, seed_z: int, seed_y: int, seed_x: int
         "percentile":        percentile,
         "closing_iter":      closing_iter,
     }
+    if ws.store is not None:
+        ws.store.write_mask(mask_name, mask=mask, meta={
+            "source":             "segment_from_seed",
+            "seed_zyx":           [seed_z, seed_y, seed_x],
+            "percentile":         percentile,
+            "closing_iter":       closing_iter,
+            "n_voxels":           int(mask.sum()),
+            "peak_speed_m_per_s": round(peak, 3),
+        })
+    return info
 
 
 # ----- verify --------------------------------------------------------------
@@ -425,7 +562,10 @@ def _tool_verify(ws: Workspace, mask_name: str) -> dict:
         voxel_size_mm=ws.voxel_size_mm,
     )
     ws.verdicts[mask_name] = verdict
-    return {"mask_name": mask_name, **to_json_safe(verdict)}
+    safe = to_json_safe(verdict)
+    if ws.store is not None:
+        ws.store.write_verdict(mask_name, {"mask_name": mask_name, **safe})
+    return {"mask_name": mask_name, **safe}
 
 
 # ----- analyze -------------------------------------------------------------
@@ -443,7 +583,130 @@ def _tool_analyze(ws: Workspace, mask_name: str,
         n_cross_sections=n_cross_sections,
     )
     ws.analyses[mask_name] = report
-    return {"mask_name": mask_name, **to_json_safe(report)}
+    safe = to_json_safe(report)
+    if ws.store is not None:
+        ws.store.write_analysis(mask_name, {"mask_name": mask_name, **safe})
+    return {"mask_name": mask_name, **safe}
+
+
+# ----- crop_mask (single-segment extraction) ------------------------------
+
+_AXIS_TO_INDEX = {"Z": 0, "Y": 1, "X": 2}
+
+
+def _tool_crop_mask(ws: Workspace,
+                    source_mask: str,
+                    target_mask: str,
+                    axis: str = "Z",
+                    start_frac: float = 0.0,
+                    end_frac: float = 1.0) -> dict:
+    """Extract a sub-region of `source_mask` along one coordinate axis and
+    save it as a new mask `target_mask`. Used to isolate a single tubular
+    segment from a branched mask (e.g. cropping a whole-aorta mask down to
+    just the descending portion) so the single-vessel net_flux verifier
+    can apply meaningfully.
+    """
+    src = ws.require_mask(source_mask)
+    if axis not in _AXIS_TO_INDEX:
+        return {"error": f"axis must be one of {list(_AXIS_TO_INDEX)}, got {axis!r}",
+                "tool":  "crop_mask"}
+    if not (0.0 <= start_frac < end_frac <= 1.0):
+        return {"error": "require 0.0 <= start_frac < end_frac <= 1.0",
+                "tool":  "crop_mask"}
+    if target_mask in ws.masks:
+        return {"error": f"target_mask {target_mask!r} already exists; pick a new name",
+                "tool":  "crop_mask"}
+
+    ax = _AXIS_TO_INDEX[axis]
+    n = src.shape[ax]
+    i0 = int(round(n * start_frac))
+    i1 = int(round(n * end_frac))
+    cropped = np.zeros_like(src)
+    sl = [slice(None)] * src.ndim
+    sl[ax] = slice(i0, i1)
+    cropped[tuple(sl)] = src[tuple(sl)]
+    ws.masks[target_mask] = cropped
+    info = {
+        "status":          "ok",
+        "source_mask":     source_mask,
+        "target_mask":     target_mask,
+        "axis":            axis,
+        "start_frac":      start_frac,
+        "end_frac":        end_frac,
+        "axis_index_range":[i0, i1],
+        "n_voxels_before": int(src.sum()),
+        "n_voxels_after":  int(cropped.sum()),
+    }
+    if ws.store is not None:
+        ws.store.write_mask(target_mask, mask=cropped, meta={
+            "source":      f"crop of {source_mask}",
+            "axis":        axis,
+            "start_frac":  start_frac,
+            "end_frac":    end_frac,
+            "n_voxels":    int(cropped.sum()),
+        })
+    return info
+
+
+# ----- read_file (scoped) --------------------------------------------------
+
+# Hard cap on how many characters any one read_file call may return to the
+# LLM. Mask metadata + verdict JSON are typically a few KB; this guards
+# against an accidental request for a binary or oversized file getting
+# rendered into the prompt.
+_READ_FILE_MAX_CHARS = 32_000
+
+
+def _tool_read_file(ws: Workspace, path: str) -> dict:
+    """Read a session-relative artifact file. Permission is checked against
+    READ_SCOPES for ws.current_role; path traversal is blocked by the store."""
+    if ws.store is None:
+        return {"error": "no session store attached to workspace", "tool": "read_file"}
+    role = ws.current_role or "<unknown>"
+    if not is_path_allowed(role, path):
+        return {
+            "error": f"role {role!r} is not allowed to read {path!r}",
+            "tool":  "read_file",
+            "role":  role,
+            "allowed_prefixes": _allowed_prefixes_for(role),
+        }
+    try:
+        text = ws.store.read_relative(path)
+    except FileNotFoundError as e:
+        return {"error": str(e), "tool": "read_file", "path": path}
+    except PermissionError as e:
+        return {"error": str(e), "tool": "read_file", "path": path}
+    truncated = len(text) > _READ_FILE_MAX_CHARS
+    return {
+        "path":       path,
+        "n_chars":    len(text),
+        "truncated":  truncated,
+        "content":    text[:_READ_FILE_MAX_CHARS],
+    }
+
+
+def _tool_list_dir(ws: Workspace, path: str = "") -> dict:
+    """List names in one session sub-directory (one level deep). Same scope
+    rules as read_file."""
+    if ws.store is None:
+        return {"error": "no session store attached to workspace", "tool": "list_dir"}
+    role = ws.current_role or "<unknown>"
+    # For directory listing, allow the empty / root case for any role that
+    # has at least one prefix (i.e. can read something) — they need a way to
+    # discover what subfolders exist.
+    if path and not is_path_allowed(role, path.rstrip("/") + "/"):
+        return {
+            "error": f"role {role!r} is not allowed to list {path!r}",
+            "tool":  "list_dir",
+            "role":  role,
+            "allowed_prefixes": _allowed_prefixes_for(role),
+        }
+    return {"path": path, "entries": ws.store.list_relative(path)}
+
+
+def _allowed_prefixes_for(role: str) -> list[str]:
+    from .session_store import READ_SCOPES
+    return list(READ_SCOPES.get(role, []))
 
 
 # ============================================================================
@@ -470,6 +733,34 @@ TOOLS: list[ToolSpec] = [
             "required": ["mat_path"],
         },
         function=_tool_load_reconstruction,
+    ),
+    ToolSpec(
+        name="load_as4df",
+        description=(
+            "Load a Stanford AS4DF (Aortic Stiffness 4D Flow) acquisition: a real "
+            "MRI scan of a 3D-printed compliant aortic phantom, with optional STL "
+            "ground-truth mask. Real PC-MRA contrast + real noise, but the vessel "
+            "geometry is known exactly — ideal for evaluating segmentation. Set "
+            "load_stl_mask=True to also load the ground-truth mask into the "
+            "workspace (skips segmentation entirely; useful for Verifier/Hemodynamic "
+            "demos). Set False to leave segmentation to the agent."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "dataset_root":  {"type": "string",
+                                  "description": "Path to AS4DF root, containing 'dicoms/' and 'stl/' folders"},
+                "model":         {"type": "string", "default": "m_c1",
+                                  "enum": ["m_c1", "m_c2", "m_r"]},
+                "n_frames":      {"type": "integer", "default": 50,
+                                  "enum": [16, 25, 50]},
+                "load_stl_mask": {"type": "boolean", "default": True,
+                                  "description": "Voxelize the STL into a ground-truth vessel mask"},
+                "mask_name":     {"type": "string", "default": "aorta_stl"},
+            },
+            "required": [],   # all params resolvable via env vars set by host
+        },
+        function=_tool_load_as4df,
     ),
     ToolSpec(
         name="load_phantom",
@@ -589,6 +880,78 @@ TOOLS: list[ToolSpec] = [
             "required": ["mask_name"],
         },
         function=_tool_analyze,
+    ),
+    ToolSpec(
+        name="crop_mask",
+        description=(
+            "Extract a sub-region of an existing mask along one coordinate "
+            "axis, saving the result as a new mask. Use this when a mask "
+            "covers a branched vessel (whole aorta = ascending + arch + "
+            "descending + supra-aortic branches) and the single-vessel "
+            "net_flux verifier returned `status: skip` for that reason. "
+            "Cropping to a fractional range along Z (or Y, X) of the most "
+            "tubular segment lets net_flux check a region where its "
+            "single-vessel assumption holds.\n\n"
+            "Typical aortic-arch isolation: axis='Z', start_frac=0.0, "
+            "end_frac=0.5 keeps the bottom half of the volume (descending "
+            "aorta) and drops the arch + ascending + branches."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "source_mask": {"type": "string",
+                                "description": "Name of the existing mask to crop."},
+                "target_mask": {"type": "string",
+                                "description": "Name to save the cropped sub-mask under."},
+                "axis":        {"type": "string", "default": "Z",
+                                "enum": ["Z", "Y", "X"]},
+                "start_frac":  {"type": "number", "default": 0.0,
+                                "minimum": 0.0, "maximum": 1.0},
+                "end_frac":    {"type": "number", "default": 1.0,
+                                "minimum": 0.0, "maximum": 1.0},
+            },
+            "required": ["source_mask", "target_mask"],
+        },
+        function=_tool_crop_mask,
+    ),
+    ToolSpec(
+        name="read_file",
+        description=(
+            "Read a session artifact (JSON / text file) by its session-relative "
+            "path. Use this to read your own tool outputs before writing a "
+            "report so the numbers you cite are grounded in actual saved data, "
+            "NOT remembered from prior reasoning. Permission is enforced per "
+            "specialist role; reading outside your allowed prefixes returns an "
+            "error listing which prefixes you may access."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "Session-relative path, e.g. "
+                                        "'verification/verify_aorta_v1.json'."},
+            },
+            "required": ["path"],
+        },
+        function=_tool_read_file,
+    ),
+    ToolSpec(
+        name="list_dir",
+        description=(
+            "List file names directly under a session sub-directory. Use this "
+            "to discover what artifacts exist (e.g. which mask names have been "
+            "produced) before deciding which file to read_file."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "default": "",
+                         "description": "Session-relative dir, e.g. "
+                                        "'segmentation/masks/'. Empty for root."},
+            },
+            "required": [],
+        },
+        function=_tool_list_dir,
     ),
 ]
 

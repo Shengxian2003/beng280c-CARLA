@@ -155,7 +155,12 @@ class Planner:
     """Wrapper around an LLM that proposes and revises plans."""
 
     def __init__(self, llm: LLM, *, project_context: str = PROJECT_CONTEXT,
-                 max_tokens: int = 8192,
+                 max_tokens: int = 16384,    # raised from 8192 so reasoning
+                                             # models (qwen3.x with thinking
+                                             # enabled) have room for both
+                                             # the thinking chain (~8 K
+                                             # tokens typical) and the
+                                             # actual JSON answer.
                  verbose_callback=None):
         self.llm = llm
         self.project_context = project_context
@@ -207,6 +212,26 @@ class Planner:
         resp = self.llm.chat(messages, json_mode=True, max_tokens=self.max_tokens)
         audit.llm_call(messages=messages, response=resp, purpose=purpose,
                        options={"json_mode": True})
+        # Reasoning-model thinking-ate-budget detector. When the model
+        # produced a non-empty `reasoning` chain but an empty `text` answer,
+        # almost always it ran out of token budget inside the <think> block
+        # and never reached the JSON. Surface that diagnostic instead of a
+        # cryptic "empty response" parse error.
+        if (not (resp.text or "").strip()) and (resp.reasoning or "").strip():
+            n_think = len(resp.reasoning or "")
+            audit.event("planner_thinking_ate_budget", {
+                "purpose":          purpose,
+                "thinking_chars":   n_think,
+                "max_tokens":       self.max_tokens,
+                "completion_tokens": resp.completion_tokens,
+            })
+            raise RuntimeError(
+                f"{failure_reason}: LLM produced {n_think} chars of "
+                f"thinking but no answer content. The reasoning chain "
+                f"likely consumed the full max_tokens={self.max_tokens} "
+                f"budget. Raise max_tokens, switch to a non-thinking "
+                f"model, or set `/no_think` in the prompt."
+            )
         try:
             return Plan.from_llm_text(resp.text)
         except (json.JSONDecodeError, ValueError) as e:

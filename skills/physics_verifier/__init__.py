@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import numpy as np
 
+from ._centerline import check_net_flux_centerline
 from ._checks import (
     check_divergence,
     check_net_flux,
@@ -58,11 +59,29 @@ def verify(
         # not necessarily by signal magnitude
         mask = velocity_mask(thetaX, thetaY, thetaZ, venc_m_per_s)
 
+    # Empty mask → all checks return "skip" with the same reason rather than
+    # crashing inside peak_velocity (.max() on a zero-size array).
+    if mask is not None and not mask.any():
+        skip = {"status": "skip", "reason": "mask is empty (zero voxels)"}
+        return {
+            "verdict": "skip",
+            "checks":  {k: dict(skip) for k in
+                        ("divergence", "net_flux", "net_flux_centerline",
+                         "peak_velocity", "phase_unwrap")},
+            "metadata": {
+                "shape_ZYXT": list(thetaX.shape),
+                "voxel_size_mm": list(voxel_size_mm),
+                "venc_m_per_s": venc_m_per_s,
+                "n_mask_voxels": 0,
+            },
+        }
+
     results = {
-        "divergence":    check_divergence(vx, vy, vz, mask, voxel_size_mm),
-        "net_flux":      check_net_flux(vx, vy, vz, mask, voxel_size_mm),
-        "peak_velocity": check_peak_velocity(vx, vy, vz, mask),
-        "phase_unwrap":  check_phase_unwrap(vx, vy, vz, venc_m_per_s),
+        "divergence":         check_divergence(vx, vy, vz, mask, voxel_size_mm),
+        "net_flux":           check_net_flux(vx, vy, vz, mask, voxel_size_mm),
+        "net_flux_centerline": check_net_flux_centerline(vx, vy, vz, mask, voxel_size_mm),
+        "peak_velocity":      check_peak_velocity(vx, vy, vz, mask),
+        "phase_unwrap":       check_phase_unwrap(vx, vy, vz, venc_m_per_s),
     }
 
     statuses = [c["status"] for c in results.values()]

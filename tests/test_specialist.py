@@ -34,21 +34,31 @@ class TestSpecialistConfig:
         specs = build_default_specialists(MockLLM(responses=[]))
         assert set(specs) == {"reconstruction", "segmentation", "verifier", "hemodynamic"}
 
-    def test_tool_allowlists_disjoint(self):
-        """Each tool should belong to exactly one specialist (the routing in
-        the viewer windows assumes this; if two specialists shared a tool, the
-        windows would double-count tool calls)."""
+    # `read_file` and `list_dir` are intentionally shared across all
+    # specialists — they are the read-side of the filesystem-grounded
+    # artifact store (per-path access control is enforced at the tool
+    # layer via READ_SCOPES, not by which specialist holds the tool name).
+    SHARED_READ_TOOLS = {"read_file", "list_dir"}
+
+    def test_action_tool_allowlists_disjoint(self):
+        """Each action tool (recon / segment / verify / analyze) should be
+        owned by exactly one specialist. read_file / list_dir are exempt —
+        they are shared utilities scoped at the tool layer."""
         specs = build_default_specialists(MockLLM(responses=[]))
         seen: dict[str, str] = {}
         for name, spec in specs.items():
             for t in spec.tool_names:
+                if t in self.SHARED_READ_TOOLS:
+                    continue
                 assert t not in seen, \
                     f"tool {t!r} shared between {seen[t]} and {name}"
                 seen[t] = name
 
-    def test_verifier_only_has_verify(self):
+    def test_verifier_action_tool_is_verify_only(self):
         specs = build_default_specialists(MockLLM(responses=[]))
-        assert specs["verifier"].tool_names == ["verify"]
+        action = [t for t in specs["verifier"].tool_names
+                  if t not in self.SHARED_READ_TOOLS]
+        assert action == ["verify"]
 
     def test_demo_mode_removes_reconstruct_tool(self):
         """In demo mode the Reconstruction specialist must not be able to
@@ -58,8 +68,10 @@ class TestSpecialistConfig:
 
         demo = build_default_specialists(MockLLM(responses=[]), demo_mode=True)
         assert "reconstruct" not in demo["reconstruction"].tool_names
-        assert demo["reconstruction"].tool_names == ["load_reconstruction"]
-        # Other specialists unaffected
+        action_tools = [t for t in demo["reconstruction"].tool_names
+                        if t not in self.SHARED_READ_TOOLS]
+        assert action_tools == ["load_reconstruction"]
+        # Other specialists unaffected (compare full lists, shared tools included)
         assert demo["segmentation"].tool_names == normal["segmentation"].tool_names
 
     def test_demo_mode_updates_reconstruction_prompt(self):
@@ -144,6 +156,36 @@ class TestSpecialistHandle:
             llm=llm,
             max_rounds=4,
         )
+
+    def test_grounding_rejects_hallucinated_number(self, tmp_path):
+        """A report citing a decimal that never appeared in any tool result
+        nor in the conversation history must be rejected. The specialist
+        gets a second round to recover. This is the architectural guard
+        against the AS4DF verifier-hallucination incident."""
+        from utility.audit import read_log, filter_log
+
+        s = self._make(
+            responses=[
+                # First attempt: fabricated number "37.35"
+                json.dumps({"done": True,
+                            "report": "Divergence is 37.35 s^-1, mask is bad."}),
+                # Second attempt: removed the number
+                json.dumps({"done": True,
+                            "report": "Divergence is elevated; mask is bad."}),
+            ],
+            tools=["verify"],
+        )
+        log_path = tmp_path / "log.jsonl"
+        log = AuditLog(log_path)
+        report = s.handle("verify the mask", workspace=Workspace(), audit=log)
+        log.close()
+        assert report["done"] is True
+        assert "37.35" not in report["report"]
+        # Audit log must record the rejection event
+        events = filter_log(read_log(log_path), kind="event")
+        kinds = [e["data"].get("name") for e in events]
+        assert any("grounding_rejection" in k for k in kinds), \
+            f"expected a grounding_rejection event in {kinds}"
 
     def test_done_in_one_step(self, tmp_path):
         s = self._make(
@@ -339,6 +381,182 @@ class TestCoordinator:
         # Summary should explain what happened
         assert "max_delegations" in result.summary
         assert "verifier" in result.summary  # specialists used should be listed
+
+    def test_missing_mask_name_blocks_verifier_delegation(self, tmp_path):
+        """When at least one mask exists in the workspace, a delegation to
+        verifier without a mask_name field must be rejected with an error
+        the Coordinator can react to. Architectural fix for the observed
+        AS4DF session where the Verifier specialist invented mask names
+        because the Coordinator never said which one to verify."""
+        import numpy as np
+        coord_llm, specs = self._make_coord(
+            responses=[
+                # First attempt: delegate to verifier with NO mask_name
+                json.dumps({"delegate_to": "verifier", "task": "verify the mask",
+                            "why": "test"}),
+                # After the rejection, Coordinator retries with mask_name
+                json.dumps({"delegate_to": "verifier", "task": "verify the mask",
+                            "mask_name": "aorta_v1", "why": "test"}),
+                json.dumps({"done": True, "summary": "done after fixing handoff"}),
+            ],
+            specialists_resps={
+                "verifier": [json.dumps({"done": True, "report": "ok"})],
+            },
+        )
+        ws = Workspace()
+        ws.masks["aorta_v1"] = np.ones((4, 4, 4), dtype=bool)
+        log_path = tmp_path / "log.jsonl"
+        log = AuditLog(log_path)
+        result = Coordinator(coord_llm, specs, ws, log,
+                             max_delegations=5).run("test")
+        log.close()
+        # The first delegation must have been rejected, second went through
+        assert result.specialists_used == ["verifier"]
+        entries = read_log(log_path)
+        events = filter_log(entries, kind="event")
+        names = [e["data"]["name"] for e in events]
+        assert "missing_mask_name_in_delegation" in names
+
+    def test_unknown_mask_name_blocks_delegation(self, tmp_path):
+        """If the Coordinator names a mask that does not exist, reject the
+        delegation rather than letting the specialist call verify() with a
+        ToolError-bound argument."""
+        import numpy as np
+        coord_llm, specs = self._make_coord(
+            responses=[
+                json.dumps({"delegate_to": "verifier", "task": "verify",
+                            "mask_name": "aorta_v99",  # not in workspace
+                            "why": "wrong-name test"}),
+                json.dumps({"done": True, "summary": "bail"}),
+            ],
+            specialists_resps={
+                "verifier": [json.dumps({"done": True, "report": "ok"})],
+            },
+        )
+        ws = Workspace()
+        ws.masks["aorta_v1"] = np.ones((4, 4, 4), dtype=bool)
+        log_path = tmp_path / "log.jsonl"
+        log = AuditLog(log_path)
+        result = Coordinator(coord_llm, specs, ws, log,
+                             max_delegations=5).run("test")
+        log.close()
+        assert result.specialists_used == []  # bad mask name → never ran
+        events = filter_log(read_log(log_path), kind="event")
+        names = [e["data"]["name"] for e in events]
+        assert "unknown_mask_name_in_delegation" in names
+
+    def test_mask_name_is_injected_into_specialist_task(self, tmp_path):
+        """When the Coordinator supplies a mask_name, the specialist's task
+        string must begin with a structured handoff line — that line is the
+        first thing the specialist's LLM sees, eliminating the guessing
+        failure mode."""
+        import numpy as np
+        coord_llm = MockLLM(responses=[
+            json.dumps({"delegate_to": "verifier",
+                        "task":        "verify the segmented mask",
+                        "mask_name":   "aorta_v1",
+                        "why":         "single mask in workspace"}),
+            json.dumps({"done": True, "summary": "verified"}),
+        ])
+        captured_task: list[str] = []
+
+        class _SpyVerifier(Specialist):
+            def handle(self, task, *, workspace, audit, verbose_callback=None):
+                captured_task.append(task)
+                return {"done": True, "report": "spy report",
+                        "tools_called": [], "n_steps": 1}
+
+        spy = _SpyVerifier(name="verifier", system_prompt="x",
+                           tool_names=[], llm=MockLLM(responses=[]),
+                           max_rounds=1)
+        ws = Workspace()
+        ws.masks["aorta_v1"] = np.ones((4, 4, 4), dtype=bool)
+        log = AuditLog(tmp_path / "log.jsonl")
+        Coordinator(coord_llm, {"verifier": spy}, ws, log,
+                    max_delegations=5).run("test")
+        log.close()
+        assert captured_task, "spy specialist was never invoked"
+        assert captured_task[0].startswith(
+            '[Coordinator handoff] mask_name = "aorta_v1"')
+
+    def test_recon_retry_blocked_when_one_shot(self, tmp_path):
+        """When supports_reconstruction_retry=False (phantom/AS4DF/no-fresh-recon),
+        a second delegation to reconstruction must be rejected rather than
+        consuming the specialist's budget on a no-op load."""
+        coord_llm = MockLLM(responses=[
+            json.dumps({"delegate_to": "reconstruction", "task": "load",
+                        "why": "first load"}),
+            # Coordinator attempts to retry reconstruction
+            json.dumps({"delegate_to": "reconstruction",
+                        "task": "run with more iterations",
+                        "why": "verifier failed"}),
+            json.dumps({"done": True, "summary": "gave up after retry blocked"}),
+        ])
+        recon_spy_calls: list[str] = []
+
+        class _SpyRecon(Specialist):
+            def handle(self, task, *, workspace, audit, verbose_callback=None):
+                recon_spy_calls.append(task)
+                return {"done": True, "report": "loaded once",
+                        "tools_called": [], "n_steps": 1}
+
+        spy = _SpyRecon(name="reconstruction", system_prompt="x",
+                        tool_names=[], llm=MockLLM(responses=[]),
+                        max_rounds=1)
+        log_path = tmp_path / "log.jsonl"
+        log = AuditLog(log_path)
+        Coordinator(coord_llm, {"reconstruction": spy}, Workspace(), log,
+                    max_delegations=5,
+                    supports_reconstruction_retry=False).run("test")
+        log.close()
+        # First delegation went through, second was blocked before reaching spy
+        assert len(recon_spy_calls) == 1
+        events = filter_log(read_log(log_path), kind="event")
+        names = [e["data"]["name"] for e in events]
+        assert "recon_retry_blocked" in names
+
+    def test_verify_fail_cap_blocks_after_threshold(self, tmp_path):
+        """After max_verify_failures_per_mask consecutive failures on the
+        same mask, the Coordinator must NOT be able to re-delegate to
+        verifier with that mask name — it has to either produce a new
+        mask under a different name, or emit done."""
+        import numpy as np
+        coord_llm = MockLLM(responses=[
+            # Attempts: verify aorta_v1 twice, then a 3rd time (should be blocked),
+            # then emit done.
+            json.dumps({"delegate_to": "verifier", "task": "verify",
+                        "mask_name": "aorta_v1", "why": "first"}),
+            json.dumps({"delegate_to": "verifier", "task": "verify again",
+                        "mask_name": "aorta_v1", "why": "second"}),
+            json.dumps({"delegate_to": "verifier", "task": "verify again",
+                        "mask_name": "aorta_v1", "why": "third — should be blocked"}),
+            json.dumps({"done": True, "summary": "honest escalation"}),
+        ])
+
+        class _FailingVerifier(Specialist):
+            def handle(self, task, *, workspace, audit, verbose_callback=None):
+                # Simulate the verifier producing a workspace verdict of fail
+                workspace.verdicts["aorta_v1"] = {"verdict": "fail",
+                                                  "checks": {}}
+                return {"done": True, "report": "failed",
+                        "tools_called": ["verify"], "n_steps": 1}
+
+        spy = _FailingVerifier(name="verifier", system_prompt="x",
+                               tool_names=[], llm=MockLLM(responses=[]),
+                               max_rounds=1)
+        ws = Workspace()
+        ws.masks["aorta_v1"] = np.ones((4, 4, 4), dtype=bool)
+        log_path = tmp_path / "log.jsonl"
+        log = AuditLog(log_path)
+        Coordinator(coord_llm, {"verifier": spy}, ws, log,
+                    max_delegations=8,
+                    max_verify_failures_per_mask=2).run("test")
+        log.close()
+        events = filter_log(read_log(log_path), kind="event")
+        names = [e["data"]["name"] for e in events]
+        # First two verifies went through; third was capped
+        assert names.count("delegation") == 2
+        assert "verify_fail_cap_blocked" in names
 
     def test_audit_log_records_delegations(self, tmp_path):
         coord_llm, specs = self._make_coord(

@@ -85,10 +85,12 @@ Nothing else. The markdown will be rendered directly to the user.
 @dataclass
 class Summarizer:
     llm: LLM
-    # Qwen 3.6 35B reasoning easily eats 2000+ tokens before emitting the
+    # Qwen 3.6 35B reasoning easily eats 8000+ tokens before emitting the
     # JSON `summary` field. Allow plenty of headroom so reasoning + output
     # both fit. Output itself is < 400 words; the rest is reasoning.
-    max_tokens: int = 8192
+    # Raised from 8192 after a planner-stage empty-content crash on a
+    # qwen3.6 run where thinking consumed the full 8192-token budget.
+    max_tokens: int = 16384
 
     def summarize(
         self,

@@ -104,7 +104,8 @@ class PlanCritic:
     """Wrapper around an LLM that reviews plans."""
 
     def __init__(self, llm: LLM, *, project_context: str = PROJECT_CONTEXT,
-                 max_tokens: int = 8192,
+                 max_tokens: int = 16384,    # see Planner — reasoning models
+                                             # need thinking + answer headroom.
                  verbose_callback=None):
         self.llm = llm
         self.project_context = project_context

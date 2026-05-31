@@ -64,7 +64,26 @@ def check_net_flux(
     should be consistent (continuity equation).
 
     Requires a proper connected vessel mask (Stage 2c) to be meaningful on real data.
+
+    Out-of-scope for branched masks: when the mask's skeleton has at least
+    one branch point the single-axis assumption (asc + arch + desc all share
+    one dominant axis) breaks, and a FAIL verdict here would penalize a
+    structurally valid mask. We return `status: skip` in that case; the
+    branched-vessel scope limit is a documented V2 follow-up.
     """
+    from ._centerline import count_skeleton_branches
+    n_branches = count_skeleton_branches(mask)
+    if n_branches >= 1:
+        return {
+            "status": "skip",
+            "reason": (f"mask skeleton has {n_branches} branch point(s); "
+                       "axis-aligned net_flux assumes a single tubular "
+                       "vessel and would mis-judge a branched mask. Crop "
+                       "to a single branch before re-verifying."),
+            "n_skeleton_branches": int(n_branches),
+            "requires_segmentation": True,
+        }
+
     dz, dy, dx = [s * 1e-3 for s in voxel_size_mm]
 
     vx_t = vx.mean(axis=-1)

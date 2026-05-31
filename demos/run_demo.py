@@ -332,13 +332,24 @@ def main():
 
     # ---- Construct LLM + workspace + audit log + specialists --------------
     llm = _build_llm(args.llm, args.model)
-    ws = Workspace()
     log = AuditLog(log_path, session_metadata={
         "goal":         args.goal,
         "llm_backend":  args.llm,
         "llm_model":    getattr(llm, "model", "?"),
         "architecture": "Planner → PlanCritic → PlanPolicy → Coordinator → 4 specialists",
         "demo_mode":    demo_mode,
+    })
+    from utility.session_store import SessionStore
+    project_root = Path(__file__).resolve().parent.parent
+    store = SessionStore(session_id=log.session_id,
+                         root=project_root / "logs" / "runs")
+    ws = Workspace(store=store)
+    store.write_input_manifest({
+        "session_id":  log.session_id,
+        "goal":        args.goal,
+        "llm_backend": args.llm,
+        "llm_model":   getattr(llm, "model", "?"),
+        "demo_mode":   demo_mode,
     })
 
     if demo_mode:
@@ -382,6 +393,10 @@ def main():
                 workspace=ws,
                 audit=log,
                 max_delegations=args.max_delegations,
+                # Demo mode = load_reconstruction only, no fresh MATLAB recon,
+                # so a re-delegation cannot tune anything. Non-demo = fresh
+                # CS recon is available; iteration retries are meaningful.
+                supports_reconstruction_retry=not demo_mode,
                 verbose_callback=lambda msg: status.update(msg),
             )
             result = coord.run(args.goal, plan=plan, warning=warning)

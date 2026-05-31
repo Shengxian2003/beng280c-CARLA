@@ -36,7 +36,10 @@ from utility.llm import MockLLM, OllamaLLM
 from agents.plan_critic import PlanCritic
 from utility.plan_policy import PolicyAction, apply_plan_policy
 from agents.planner import Plan, Planner
-from utility.input_modes import REGISTRY, InputMode, get_profile, with_no_fresh_recon
+from utility.input_modes import (
+    REGISTRY, InputMode, get_profile,
+    with_no_fresh_recon, with_no_seg_passthrough,
+)
 from agents.specialist import build_default_specialists
 from agents.summarizer import Summarizer
 from utility.tools import Workspace
@@ -368,6 +371,10 @@ def main():
     p.add_argument("--phantom", action="store_true",
                    help="DEPRECATED — equivalent to --input-mode phantom. "
                         "Kept for backward compatibility.")
+    p.add_argument("--no-seg-passthrough", action="store_true",
+                   help="Disable segmentation passthrough for modes that "
+                        "normally pre-load a mask (used when AS4DF STL toggle "
+                        "is off, so the seg specialist regains its tools).")
     args = p.parse_args()
     demo_mode = args.no_fresh_recon
 
@@ -381,6 +388,8 @@ def main():
         profile = REGISTRY[InputMode.REAL_SCAN]
     if demo_mode:
         profile = with_no_fresh_recon(profile)
+    if args.no_seg_passthrough:
+        profile = with_no_seg_passthrough(profile)
 
     # If the user did not pass an explicit --goal, build it from the profile.
     if args.goal == DEFAULT_GOAL:
@@ -410,7 +419,6 @@ def main():
                       "lines on stderr.[/]")
 
     llm = _build_llm(args.llm, args.model, host=args.llm_host)
-    ws = Workspace()
     log = AuditLog(log_path, session_metadata={
         "goal":         args.goal,
         "llm_backend":  args.llm,
@@ -419,6 +427,25 @@ def main():
         "view":         "single_window",
         "input_mode":   profile.cli_flag,
         "demo_mode":    demo_mode,
+    })
+    # Filesystem-backed artifact store under medict/logs/runs/<session_id>/.
+    # Every tool dual-writes here so the LLM can later read its own JSON
+    # output via the scoped read_file tool — the grounding for anti-
+    # hallucination defenses in Stage 3.
+    from utility.session_store import SessionStore
+    project_root  = Path(__file__).resolve().parent.parent
+    store = SessionStore(session_id=log.session_id,
+                         root=project_root / "logs" / "runs")
+    ws = Workspace(store=store)
+    # Record the run manifest immediately so even an early crash leaves a
+    # readable session directory.
+    store.write_input_manifest({
+        "session_id":  log.session_id,
+        "input_mode":  profile.cli_flag,
+        "goal":        args.goal,
+        "llm_backend": args.llm,
+        "llm_model":   getattr(llm, "model", "?"),
+        "demo_mode":   demo_mode,
     })
 
     # ---- Phase 1 + 2 (plan + critic + policy) ----------------------------
@@ -452,6 +479,7 @@ def main():
         llm=llm, specialists=specialists, workspace=ws, audit=log,
         max_delegations=args.max_delegations,
         verbose_callback=_make_inline_callback(console, "yellow"),
+        supports_reconstruction_retry=profile.supports_reconstruction_retry,
     )
 
     try:
